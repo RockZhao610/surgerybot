@@ -1,0 +1,30 @@
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.tmp
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# Logs & runtime
+logs/
+*.log
+
+# Generated artifacts
+surgical_robot_app/3d_recon/result/
+path_data/
+
+# Large model weights (downloaded)
+models/sam2/*.pt
+
