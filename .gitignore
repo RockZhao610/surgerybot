@@ -21,10 +21,13 @@ env/
 logs/
 *.log
 
-# Generated artifacts
-surgical_robot_app/3d_recon/result/
+# Model files
+models/
+
+# Data files
+surgical_robot_app/test_data/
 path_data/
 
-# Large model weights (downloaded)
-models/sam2/*.pt
+# Generated artifacts
+surgical_robot_app/3d_recon/result/
 
