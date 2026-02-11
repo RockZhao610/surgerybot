@@ -13,6 +13,8 @@ from PyQt5.QtWidgets import (
     QListWidget,
     QWidget,
     QProgressBar,
+    QSlider,
+    QCheckBox,
 )
 from PyQt5.QtCore import Qt
 
@@ -120,6 +122,18 @@ def build_view3d_ui(parent_widget=None) -> dict:
     btn_generate_path = QPushButton("Generate")
     btn_generate_path.setFixedHeight(35)
     
+    btn_replay_path = QPushButton("Replay")
+    btn_replay_path.setObjectName("secondary_btn")
+    btn_replay_path.setFixedHeight(35)
+    btn_replay_path.setToolTip("Replay the RRT exploration animation")
+    btn_replay_path.setEnabled(False)  # 初始禁用，规划完成后启用
+    
+    btn_simulate_path = QPushButton("Simulate")
+    btn_simulate_path.setObjectName("secondary_btn")
+    btn_simulate_path.setFixedHeight(35)
+    btn_simulate_path.setToolTip("Animate instrument movement along the planned path")
+    btn_simulate_path.setEnabled(False)  # 初始禁用，规划完成后启用
+    
     btn_save_path = QPushButton("Save")
     btn_save_path.setObjectName("secondary_btn")
     btn_save_path.setFixedHeight(35)
@@ -129,9 +143,46 @@ def build_view3d_ui(parent_widget=None) -> dict:
     btn_reset_path.setFixedHeight(35)
     
     path_control_layout.addWidget(btn_generate_path, 2)
+    path_control_layout.addWidget(btn_replay_path, 1)
+    path_control_layout.addWidget(btn_simulate_path, 1)
     path_control_layout.addWidget(btn_save_path, 1)
     path_control_layout.addWidget(btn_reset_path, 1)
     path_layout.addWidget(path_control)
+    
+    # Simulation speed slider row
+    sim_speed_row = QWidget()
+    sim_speed_layout = QHBoxLayout()
+    sim_speed_layout.setContentsMargins(0, 0, 0, 0)
+    sim_speed_layout.setSpacing(6)
+    sim_speed_row.setLayout(sim_speed_layout)
+    
+    sim_speed_label = QLabel("Speed:")
+    sim_speed_label.setFixedWidth(42)
+    sim_speed_label.setStyleSheet("color: #7F8C8D; font-size: 11px;")
+    
+    sim_speed_slider = QSlider(Qt.Horizontal)
+    sim_speed_slider.setRange(1, 10)   # 1=slowest, 10=fastest
+    sim_speed_slider.setValue(5)        # default medium
+    sim_speed_slider.setTickPosition(QSlider.TicksBelow)
+    sim_speed_slider.setTickInterval(1)
+    sim_speed_slider.setToolTip("Adjust simulation & replay speed (1=slow, 10=fast)")
+    
+    sim_speed_value_label = QLabel("5")
+    sim_speed_value_label.setFixedWidth(18)
+    sim_speed_value_label.setAlignment(Qt.AlignCenter)
+    sim_speed_value_label.setStyleSheet("color: #7F8C8D; font-size: 11px;")
+    
+    sim_speed_layout.addWidget(sim_speed_label)
+    sim_speed_layout.addWidget(sim_speed_slider, 1)
+    sim_speed_layout.addWidget(sim_speed_value_label)
+    path_layout.addWidget(sim_speed_row)
+    
+    # Safety zone checkbox
+    chk_safety_zone = QCheckBox("Show Safety Zone")
+    chk_safety_zone.setToolTip("Display a semi-transparent tube around the path representing the safety margin")
+    chk_safety_zone.setEnabled(False)  # enabled after path is generated
+    chk_safety_zone.setStyleSheet("color: #7F8C8D; font-size: 11px;")
+    path_layout.addWidget(chk_safety_zone)
     
     middle_layout.addWidget(path_group)
     
@@ -151,7 +202,12 @@ def build_view3d_ui(parent_widget=None) -> dict:
         'btn_pick_end': btn_pick_end,
         'path_list': path_list,
         'btn_generate_path': btn_generate_path,
+        'btn_replay_path': btn_replay_path,
+        'btn_simulate_path': btn_simulate_path,
         'btn_save_path': btn_save_path,
         'btn_reset_path': btn_reset_path,
+        'sim_speed_slider': sim_speed_slider,
+        'sim_speed_value_label': sim_speed_value_label,
+        'chk_safety_zone': chk_safety_zone,
     }
 

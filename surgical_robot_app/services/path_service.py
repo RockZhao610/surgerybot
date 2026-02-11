@@ -38,8 +38,23 @@ class PathService:
         if data_manager:
             try:
                 # 检查 seg_mask_volume 是否存在且有效
-                if hasattr(data_manager, 'seg_mask_volume') and data_manager.seg_mask_volume is not None:
+                seg_mask_volume = None
+                if hasattr(data_manager, 'seg_mask_volume'):
                     seg_mask_volume = data_manager.seg_mask_volume
+                
+                # 如果没有 seg_mask_volume，尝试从 masks 构建
+                if seg_mask_volume is None and hasattr(data_manager, 'masks'):
+                    masks = data_manager.masks
+                    if masks and len(masks) > 0:
+                        first_mask = next((m for m in masks if m is not None), None)
+                        if first_mask is not None:
+                            seg_mask_volume = np.stack(
+                                [m if m is not None else np.zeros_like(first_mask) for m in masks],
+                                axis=0
+                            )
+                            logger.info(f"从 masks 构建 seg_mask_volume: shape={seg_mask_volume.shape}")
+                
+                if seg_mask_volume is not None and seg_mask_volume.sum() > 0:
                     # 获取体素间距
                     spacing = None
                     metadata = data_manager.get_metadata()
@@ -48,9 +63,13 @@ class PathService:
                         if isinstance(s, (list, tuple)) and len(s) == 3:
                             spacing = (float(s[0]), float(s[1]), float(s[2]))
                     
-                    self.path_controller.set_obstacle_from_volume(seg_mask_volume, spacing=spacing)
+                    # 多标签 mask: 将所有非零值（标签 ID）统一转为 255 作为障碍物
+                    binary_volume = np.where(seg_mask_volume > 0, 255, 0).astype(np.uint8)
+                    self.path_controller.set_obstacle_from_volume(binary_volume, spacing=spacing)
                     obstacle_set = True
-                    logger.info("Obstacles set from segmentation volume")
+                    logger.info(f"Obstacles set from segmentation volume: shape={seg_mask_volume.shape}, labels={np.unique(seg_mask_volume).tolist()}")
+                else:
+                    logger.info("seg_mask_volume 为空或全零，尝试其他方式")
             except Exception as e:
                 logger.warning(f"Failed to set obstacles from volume: {e}")
         
@@ -78,10 +97,19 @@ class PathService:
                 
         return obstacle_set
 
-    def plan_path(self, smooth: bool = True, progress_callback: Optional[Callable[[int], None]] = None) -> List[Tuple[float, float, float]]:
+    def plan_path(
+        self,
+        smooth: bool = True,
+        progress_callback: Optional[Callable[[int], None]] = None,
+        tree_callback: Optional[Callable[[dict], None]] = None
+    ) -> List[Tuple[float, float, float]]:
         """调用控制器规划路径"""
         try:
-            return self.path_controller.generate_path(smooth=smooth, progress_callback=progress_callback)
+            return self.path_controller.generate_path(
+                smooth=smooth,
+                progress_callback=progress_callback,
+                tree_callback=tree_callback
+            )
         except Exception as e:
             logger.error(f"Path planning failed: {e}")
             raise e

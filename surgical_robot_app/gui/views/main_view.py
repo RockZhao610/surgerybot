@@ -704,6 +704,22 @@ class MainView(QWidget):
         if self.btn_pick_3d:
             self.btn_pick_3d.setEnabled(True)
     
+    def _on_sim_speed_changed(self, value: int):
+        """Speed slider value changed — update simulation & replay speed."""
+        # Update label
+        if self.sim_speed_value_label:
+            self.sim_speed_value_label.setText(str(value))
+        # Map slider 1-10 to frame interval:  1→100ms(slow)  10→10ms(fast)
+        frame_ms = max(10, 110 - value * 10)
+        if self.path_ui_ctrl:
+            self.path_ui_ctrl._sim_speed_ms = frame_ms
+            self.path_ui_ctrl._replay_speed_ms = frame_ms
+            # If currently animating, apply new speed immediately
+            if self.path_ui_ctrl._is_simulating and self.path_ui_ctrl._sim_timer:
+                self.path_ui_ctrl._sim_timer.setInterval(frame_ms)
+            if self.path_ui_ctrl._is_replaying and self.path_ui_ctrl._replay_timer:
+                self.path_ui_ctrl._replay_timer.setInterval(frame_ms)
+
     def _on_3d_point_added(self, coord_3d):
         """3D点添加回调"""
         logger.debug(f"3D point added: {coord_3d}")
@@ -985,8 +1001,13 @@ class MainView(QWidget):
             self.btn_pick_end = view3d_ui['btn_pick_end']
             self.path_list = view3d_ui['path_list']
             self.btn_generate_path = view3d_ui['btn_generate_path']
+            self.btn_replay_path = view3d_ui['btn_replay_path']
+            self.btn_simulate_path = view3d_ui['btn_simulate_path']
             self.btn_save_path = view3d_ui['btn_save_path']
             self.btn_reset_path = view3d_ui['btn_reset_path']
+            self.sim_speed_slider = view3d_ui['sim_speed_slider']
+            self.sim_speed_value_label = view3d_ui['sim_speed_value_label']
+            self.chk_safety_zone = view3d_ui['chk_safety_zone']
             
             # 初始化 VTK renderer
             self.vtk_renderer = vtkRenderer()
@@ -1044,8 +1065,13 @@ class MainView(QWidget):
             self.btn_pick_end = None
             self.path_list = None
             self.btn_generate_path = None
+            self.btn_replay_path = None
+            self.btn_simulate_path = None
             self.btn_save_path = None
             self.btn_reset_path = None
+            self.sim_speed_slider = None
+            self.sim_speed_value_label = None
+            self.chk_safety_zone = None
             self.view3d = None
         
         # 2D Slice Views 面板已删除，选点功能已移到弹窗对话框
@@ -1091,6 +1117,10 @@ class MainView(QWidget):
             self.btn_clear_prompts = sam2_ui['btn_clear_prompts']
             self.btn_start_seg = sam2_ui['btn_start_seg']
             self.btn_sam2_volume_3d = sam2_ui['btn_sam2_volume_3d']
+            # 标签选择器
+            self.combo_label = sam2_ui.get('combo_label')
+            self.btn_add_label = sam2_ui.get('btn_add_label')
+            self.btn_remove_label = sam2_ui.get('btn_remove_label')
             # 保存引用以便后续启用/禁用
             self.btn_add_positive_ref = self.btn_add_positive
             self.btn_add_negative_ref = self.btn_add_negative
@@ -1116,6 +1146,9 @@ class MainView(QWidget):
             self.btn_clear_prompts = None
             self.btn_start_seg = None
             self.btn_sam2_volume_3d = None
+            self.combo_label = None
+            self.btn_add_label = None
+            self.btn_remove_label = None
             self.btn_add_positive_ref = None
             self.btn_add_negative_ref = None
             self.btn_add_box_ref = None
@@ -1204,6 +1237,14 @@ class MainView(QWidget):
                 self.btn_pick_end.clicked.connect(lambda: self.path_ui_ctrl.handle_set_pick_mode('end'))
             if self.btn_generate_path:
                 self.btn_generate_path.clicked.connect(self.path_ui_ctrl.handle_generate_path)
+            if self.btn_replay_path:
+                self.btn_replay_path.clicked.connect(self.path_ui_ctrl.handle_replay_rrt)
+            if self.btn_simulate_path:
+                self.btn_simulate_path.clicked.connect(self.path_ui_ctrl.handle_simulate_path)
+            if self.sim_speed_slider:
+                self.sim_speed_slider.valueChanged.connect(self._on_sim_speed_changed)
+            if self.chk_safety_zone:
+                self.chk_safety_zone.toggled.connect(self.path_ui_ctrl.handle_toggle_safety_zone)
             if self.btn_save_path:
                 self.btn_save_path.clicked.connect(self.path_ui_ctrl.handle_save_path)
             if self.btn_reset_path:
@@ -1251,6 +1292,16 @@ class MainView(QWidget):
                 self.btn_switch_mask.clicked.connect(self.sam2_ui_ctrl.handle_switch_mask)
             if self.btn_sam2_volume_3d:
                 self.btn_sam2_volume_3d.clicked.connect(self.sam2_ui_ctrl.handle_sam2_volume_3d)
+        
+        # 标签选择器信号连接
+        if self.combo_label:
+            self.combo_label.currentIndexChanged.connect(self._on_label_changed)
+            # 初始化标签列表
+            self._refresh_label_combo()
+        if self.btn_add_label:
+            self.btn_add_label.clicked.connect(self._on_add_label)
+        if self.btn_remove_label:
+            self.btn_remove_label.clicked.connect(self._on_remove_label)
         
         # 2D Slice Views 面板已删除，相关信号连接已移除
         
@@ -1486,6 +1537,83 @@ class MainView(QWidget):
     # on_enable_3d_pick, on_clear_3d_points, on_set_path_point_from_list 方法已删除
     # （2D Slice Views 面板已删除，选点功能已移到弹窗对话框）
     
+    # ==================== 多标签管理 ====================
+    
+    def _refresh_label_combo(self):
+        """刷新标签下拉框"""
+        if not self.combo_label or not self.data_manager:
+            return
+        
+        self.combo_label.blockSignals(True)
+        self.combo_label.clear()
+        
+        from surgical_robot_app.gui.ui_builders.sam2_ui import _create_color_icon
+        
+        for label_id in self.data_manager.get_all_label_ids():
+            name = self.data_manager.label_names.get(label_id, f"Label {label_id}")
+            color = self.data_manager.get_label_color(label_id)
+            icon = _create_color_icon(color)
+            self.combo_label.addItem(icon, f"{name}", label_id)
+        
+        # 选中当前标签
+        current = self.data_manager.get_current_label()
+        for i in range(self.combo_label.count()):
+            if self.combo_label.itemData(i) == current:
+                self.combo_label.setCurrentIndex(i)
+                break
+        
+        self.combo_label.blockSignals(False)
+    
+    def _on_label_changed(self, index):
+        """标签下拉框选择变化"""
+        if not self.combo_label or not self.data_manager:
+            return
+        label_id = self.combo_label.itemData(index)
+        if label_id is not None:
+            self.data_manager.set_current_label(label_id)
+            # 刷新切片显示
+            if self.slice_editor_ctrl and hasattr(self.slice_editor_ctrl, 'slice_slider'):
+                current_idx = self.slice_editor_ctrl.slice_slider.value()
+                self.slice_editor_ctrl.update_slice_display(current_idx)
+    
+    def _on_add_label(self):
+        """添加新标签"""
+        if not self.data_manager:
+            return
+        from PyQt5.QtWidgets import QInputDialog
+        name, ok = QInputDialog.getText(self, "New Label", "Label name:", text=f"Label {self.data_manager._next_label_id}")
+        if ok and name.strip():
+            label_id = self.data_manager.add_label(name.strip())
+            self.data_manager.set_current_label(label_id)
+            self._refresh_label_combo()
+    
+    def _on_remove_label(self):
+        """删除当前标签"""
+        if not self.data_manager:
+            return
+        current = self.data_manager.get_current_label()
+        label_names = self.data_manager.get_label_names()
+        
+        if len(label_names) <= 1:
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.information(self, "Info", "At least one label is required.")
+            return
+        
+        from PyQt5.QtWidgets import QMessageBox
+        name = label_names.get(current, f"Label {current}")
+        reply = QMessageBox.question(
+            self, "Delete Label",
+            f"Delete \"{name}\" and all its segmentation data?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
+            self.data_manager.remove_label(current)
+            self._refresh_label_combo()
+            # 刷新切片显示
+            if self.slice_editor_ctrl and hasattr(self.slice_editor_ctrl, 'slice_slider'):
+                current_idx = self.slice_editor_ctrl.slice_slider.value()
+                self.slice_editor_ctrl.update_slice_display(current_idx)
+    
     def on_toggle_slice_view(self):
         """
         切换2D切片视图面板的显示/隐藏
@@ -1522,3 +1650,42 @@ class MainView(QWidget):
             if self.right_panel_widget:
                 self.right_panel_widget.update()
                 self.right_panel_widget.adjustSize()
+    
+    def closeEvent(self, event):
+        """
+        窗口关闭事件 - 正确清理 VTK 资源以避免 OpenGL 错误
+        """
+        try:
+            # 清理碰撞可视化
+            if hasattr(self, 'path_ui_ctrl') and self.path_ui_ctrl:
+                if hasattr(self.path_ui_ctrl, 'viz_manager') and self.path_ui_ctrl.viz_manager:
+                    self.path_ui_ctrl.viz_manager.clear_collision_visualization()
+            
+            # 清理 VTK 渲染窗口
+            if hasattr(self, 'vtk_widget') and self.vtk_widget:
+                try:
+                    rw = self.vtk_widget.GetRenderWindow()
+                    if rw:
+                        # 先移除所有渲染器
+                        if hasattr(self, 'vtk_renderer') and self.vtk_renderer:
+                            self.vtk_renderer.RemoveAllViewProps()
+                        # 完成渲染窗口
+                        rw.Finalize()
+                        # 释放交互器
+                        iren = rw.GetInteractor()
+                        if iren:
+                            iren.TerminateApp()
+                except Exception as e:
+                    pass  # 忽略清理过程中的错误
+            
+            # 关闭独立的 3D 重建窗口
+            if hasattr(self, 'reconstruction_window') and self.reconstruction_window:
+                try:
+                    self.reconstruction_window.close()
+                except Exception:
+                    pass
+                    
+        except Exception as e:
+            pass  # 确保关闭事件不会因为清理错误而失败
+        
+        event.accept()

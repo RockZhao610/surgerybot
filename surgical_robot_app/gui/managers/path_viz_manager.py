@@ -12,16 +12,23 @@ from typing import List, Tuple, Optional, Dict
 try:
     from vtkmodules.vtkRenderingCore import vtkRenderer, vtkActor, vtkPolyDataMapper
     from vtkmodules.vtkFiltersSources import vtkSphereSource
+    from vtkmodules.vtkFiltersCore import vtkTubeFilter
+    from vtkmodules.vtkCommonCore import vtkPoints
+    from vtkmodules.vtkCommonDataModel import vtkCellArray, vtkPolyData
 except ImportError:
     vtkRenderer = None
     vtkActor = None
     vtkPolyDataMapper = None
     vtkSphereSource = None
+    vtkTubeFilter = None
+    vtkPoints = None
+    vtkCellArray = None
+    vtkPolyData = None
 
 from PyQt5.QtWidgets import QApplication
 
 from surgical_robot_app.utils.logger import get_logger
-from surgical_robot_app.vtk_utils.coords import get_model_bounds
+from surgical_robot_app.vtk_utils.coords import get_model_bounds, space_to_world
 from surgical_robot_app.vtk_utils.markers import create_sphere_marker
 from surgical_robot_app.vtk_utils.path import create_polyline_actor_from_space_points
 
@@ -40,11 +47,23 @@ class PathVizManager:
         self._preview_marker_actor: Optional[vtkActor] = None
         self._reconstruction_preview_marker_actor: Optional[vtkActor] = None
         
+        # RRT 探索树实时可视化
+        self._rrt_tree_actor: Optional[vtkActor] = None
+        self._rrt_found_path_actor: Optional[vtkActor] = None
+        
         # 独立窗口引用
         self.reconstruction_window = None
         
+        # Safety zone tube
+        self._safety_tube_actor: Optional[vtkActor] = None
+        
+        # 路径仿真器械 actor
+        self._sim_instrument_actor: Optional[vtkActor] = None
+        self._sim_trail_actor: Optional[vtkActor] = None  # 已走过的轨迹
+        
         # 深度参考线
         self.depth_reference_lines: List[vtkActor] = []
+        
 
     def update_vtk_display(self):
         """更新 VTK 显示"""
@@ -263,4 +282,332 @@ class PathVizManager:
                     pass
             self.depth_reference_lines = []
             self.update_vtk_display()
+
+    # -------------------- RRT 探索树实时可视化 --------------------
+
+    def update_rrt_tree_viz(
+        self,
+        edges: List[Tuple[Tuple[float, float, float], Tuple[float, float, float]]],
+        found_path: Optional[List[Tuple[float, float, float]]] = None,
+    ):
+        """
+        更新 RRT 探索树的实时可视化。
+        
+        Args:
+            edges: 树的边列表 [(parent_space, child_space), ...]，坐标为 [0,100] 空间
+            found_path: 如果已找到路径，传入路径点列表（用绿色高亮）
+        """
+        if self.vtk_renderer is None or vtkPoints is None:
+            return
+        
+        # 获取模型边界用于坐标转换
+        bounds = get_model_bounds(self.vtk_renderer)
+        if bounds and len(bounds) >= 6:
+            b = bounds
+        else:
+            b = (-50.0, 50.0, -50.0, 50.0, -50.0, 50.0)
+        
+        # --- 1. 渲染探索树（半透明灰色） ---
+        if self._rrt_tree_actor:
+            try:
+                self.vtk_renderer.RemoveActor(self._rrt_tree_actor)
+            except:
+                pass
+            self._rrt_tree_actor = None
+        
+        if edges:
+            points = vtkPoints()
+            lines = vtkCellArray()
+            
+            for parent_pt, child_pt in edges:
+                wp = space_to_world(b, parent_pt)
+                wc = space_to_world(b, child_pt)
+                id1 = points.InsertNextPoint(wp)
+                id2 = points.InsertNextPoint(wc)
+                lines.InsertNextCell(2)
+                lines.InsertCellPoint(id1)
+                lines.InsertCellPoint(id2)
+            
+            polydata = vtkPolyData()
+            polydata.SetPoints(points)
+            polydata.SetLines(lines)
+            
+            mapper = vtkPolyDataMapper()
+            mapper.SetInputData(polydata)
+            
+            actor = vtkActor()
+            actor.SetMapper(mapper)
+            actor.GetProperty().SetColor(0.6, 0.6, 0.6)   # 灰色
+            actor.GetProperty().SetOpacity(0.25)            # 半透明
+            actor.GetProperty().SetLineWidth(1.0)
+            
+            self.vtk_renderer.AddActor(actor)
+            self._rrt_tree_actor = actor
+        
+        # --- 2. 渲染已找到的路径（绿色高亮） ---
+        if self._rrt_found_path_actor:
+            try:
+                self.vtk_renderer.RemoveActor(self._rrt_found_path_actor)
+            except:
+                pass
+            self._rrt_found_path_actor = None
+        
+        if found_path and len(found_path) >= 2:
+            path_points = vtkPoints()
+            path_lines = vtkCellArray()
+            
+            for pt in found_path:
+                w = space_to_world(b, pt)
+                path_points.InsertNextPoint(w)
+            
+            for i in range(len(found_path) - 1):
+                path_lines.InsertNextCell(2)
+                path_lines.InsertCellPoint(i)
+                path_lines.InsertCellPoint(i + 1)
+            
+            path_polydata = vtkPolyData()
+            path_polydata.SetPoints(path_points)
+            path_polydata.SetLines(path_lines)
+            
+            path_mapper = vtkPolyDataMapper()
+            path_mapper.SetInputData(path_polydata)
+            
+            path_actor = vtkActor()
+            path_actor.SetMapper(path_mapper)
+            path_actor.GetProperty().SetColor(0.0, 1.0, 0.3)  # 绿色
+            path_actor.GetProperty().SetOpacity(0.9)
+            path_actor.GetProperty().SetLineWidth(3.0)
+            
+            self.vtk_renderer.AddActor(path_actor)
+            self._rrt_found_path_actor = path_actor
+        
+        # 刷新显示
+        self.update_vtk_display()
+        QApplication.processEvents()
+
+    def clear_rrt_tree_viz(self):
+        """清除 RRT 探索树可视化"""
+        if self.vtk_renderer:
+            if self._rrt_tree_actor:
+                try:
+                    self.vtk_renderer.RemoveActor(self._rrt_tree_actor)
+                except:
+                    pass
+                self._rrt_tree_actor = None
+            if self._rrt_found_path_actor:
+                try:
+                    self.vtk_renderer.RemoveActor(self._rrt_found_path_actor)
+                except:
+                    pass
+                self._rrt_found_path_actor = None
+
+    # -------------------- Path Simulation Visualization --------------------
+
+    def update_sim_instrument(self, world_pos: Tuple[float, float, float], size: float = None):
+        """
+        Update the simulation instrument (sphere) position.
+        
+        Args:
+            world_pos: (x, y, z) in world coordinates
+            size: sphere radius; auto-calculated from model bounds if None
+        """
+        if self.vtk_renderer is None or vtkSphereSource is None:
+            return
+        
+        # Remove old actor
+        if self._sim_instrument_actor:
+            try:
+                self.vtk_renderer.RemoveActor(self._sim_instrument_actor)
+            except:
+                pass
+            self._sim_instrument_actor = None
+        
+        # Calculate size from model bounds if not provided
+        if size is None:
+            bounds = get_model_bounds(self.vtk_renderer)
+            if bounds:
+                xmin, xmax, ymin, ymax, zmin, zmax = bounds
+                size = max(xmax - xmin, ymax - ymin, zmax - zmin) * 0.02
+            else:
+                size = 2.0
+        
+        sphere = vtkSphereSource()
+        sphere.SetCenter(world_pos[0], world_pos[1], world_pos[2])
+        sphere.SetRadius(size)
+        sphere.SetThetaResolution(24)
+        sphere.SetPhiResolution(24)
+        sphere.Update()
+        
+        mapper = vtkPolyDataMapper()
+        mapper.SetInputConnection(sphere.GetOutputPort())
+        
+        actor = vtkActor()
+        actor.SetMapper(mapper)
+        actor.GetProperty().SetColor(0.0, 0.8, 1.0)  # cyan
+        actor.GetProperty().SetOpacity(0.95)
+        actor.GetProperty().SetSpecular(0.6)
+        actor.GetProperty().SetSpecularPower(30)
+        
+        self.vtk_renderer.AddActor(actor)
+        self._sim_instrument_actor = actor
+
+    def update_sim_trail(self, world_points: List[Tuple[float, float, float]]):
+        """
+        Draw the trail (already-traversed portion) of the simulation path.
+        
+        Args:
+            world_points: list of world-coord points for the trail
+        """
+        if self.vtk_renderer is None or vtkPoints is None:
+            return
+        
+        # Remove old trail
+        if self._sim_trail_actor:
+            try:
+                self.vtk_renderer.RemoveActor(self._sim_trail_actor)
+            except:
+                pass
+            self._sim_trail_actor = None
+        
+        if len(world_points) < 2:
+            return
+        
+        points = vtkPoints()
+        lines = vtkCellArray()
+        for pt in world_points:
+            points.InsertNextPoint(pt)
+        for i in range(len(world_points) - 1):
+            lines.InsertNextCell(2)
+            lines.InsertCellPoint(i)
+            lines.InsertCellPoint(i + 1)
+        
+        polydata = vtkPolyData()
+        polydata.SetPoints(points)
+        polydata.SetLines(lines)
+        
+        mapper = vtkPolyDataMapper()
+        mapper.SetInputData(polydata)
+        
+        actor = vtkActor()
+        actor.SetMapper(mapper)
+        actor.GetProperty().SetColor(0.0, 1.0, 0.5)  # bright green
+        actor.GetProperty().SetOpacity(0.9)
+        actor.GetProperty().SetLineWidth(4.0)
+        
+        self.vtk_renderer.AddActor(actor)
+        self._sim_trail_actor = actor
+
+    def clear_sim_viz(self):
+        """Clear all simulation visualization (instrument + trail)."""
+        if self.vtk_renderer:
+            if self._sim_instrument_actor:
+                try:
+                    self.vtk_renderer.RemoveActor(self._sim_instrument_actor)
+                except:
+                    pass
+                self._sim_instrument_actor = None
+            if self._sim_trail_actor:
+                try:
+                    self.vtk_renderer.RemoveActor(self._sim_trail_actor)
+                except:
+                    pass
+                self._sim_trail_actor = None
+
+    # -------------------- Safety Zone Tube Visualization --------------------
+
+    def show_safety_tube(
+        self,
+        path_space_points: List[Tuple[float, float, float]],
+        safety_radius_world: float = None,
+    ):
+        """
+        Display a semi-transparent tube around the path representing the safety margin.
+        
+        Args:
+            path_space_points: path in [0,100] normalised space coordinates
+            safety_radius_world: tube radius in world units. If None, auto-calculated
+                                 as 2% of the model's bounding-box diagonal.
+        """
+        if self.vtk_renderer is None or vtkTubeFilter is None or vtkPoints is None:
+            return
+        
+        # Remove any existing tube first
+        self.clear_safety_tube()
+        
+        if len(path_space_points) < 2:
+            return
+        
+        bounds = get_model_bounds(self.vtk_renderer)
+        if bounds and len(bounds) >= 6:
+            b = bounds
+        else:
+            b = (-50.0, 50.0, -50.0, 50.0, -50.0, 50.0)
+        
+        # Auto-calculate radius if not provided
+        if safety_radius_world is None:
+            dx = b[1] - b[0]
+            dy = b[3] - b[2]
+            dz = b[5] - b[4]
+            diagonal = (dx**2 + dy**2 + dz**2) ** 0.5
+            safety_radius_world = diagonal * 0.02  # 2% of diagonal
+        
+        # Build polyline in world coordinates
+        points = vtkPoints()
+        lines = vtkCellArray()
+        
+        for pt in path_space_points:
+            w = space_to_world(b, pt)
+            points.InsertNextPoint(w)
+        
+        n = len(path_space_points)
+        lines.InsertNextCell(n)
+        for i in range(n):
+            lines.InsertCellPoint(i)
+        
+        polydata = vtkPolyData()
+        polydata.SetPoints(points)
+        polydata.SetLines(lines)
+        
+        # Apply tube filter
+        tube = vtkTubeFilter()
+        tube.SetInputData(polydata)
+        tube.SetRadius(safety_radius_world)
+        tube.SetNumberOfSides(20)
+        tube.CappingOn()
+        tube.Update()
+        
+        mapper = vtkPolyDataMapper()
+        mapper.SetInputConnection(tube.GetOutputPort())
+        
+        actor = vtkActor()
+        actor.SetMapper(mapper)
+        actor.GetProperty().SetColor(0.2, 0.9, 0.3)   # green
+        actor.GetProperty().SetOpacity(0.18)            # semi-transparent
+        actor.GetProperty().SetSpecular(0.1)
+        
+        # Enable depth peeling for correct transparency rendering
+        rw = None
+        if self.vtk_widget and hasattr(self.vtk_widget, 'GetRenderWindow'):
+            rw = self.vtk_widget.GetRenderWindow()
+        if rw:
+            rw.SetAlphaBitPlanes(1)
+            rw.SetMultiSamples(0)
+            self.vtk_renderer.SetUseDepthPeeling(1)
+            self.vtk_renderer.SetMaximumNumberOfPeels(8)
+            self.vtk_renderer.SetOcclusionRatio(0.1)
+        
+        self.vtk_renderer.AddActor(actor)
+        self._safety_tube_actor = actor
+        
+        self.update_vtk_display()
+
+    def clear_safety_tube(self):
+        """Remove the safety zone tube from the renderer."""
+        if self.vtk_renderer and self._safety_tube_actor:
+            try:
+                self.vtk_renderer.RemoveActor(self._safety_tube_actor)
+            except:
+                pass
+            self._safety_tube_actor = None
+
 

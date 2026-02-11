@@ -433,11 +433,11 @@ class SAM2UIController(QObject):
             self.parent_widget.recon_progress.setVisible(False)
             
         if masks is not None and masks.size > 0:
-            # 将 3D 掩码数组转换为列表格式
-            masks_list = [masks[i] for i in range(masks.shape[0])]
-            # 保存分割结果
-            self.data_manager.masks = masks_list
-            self.data_manager._update_seg_mask_volume()
+            # 逐切片写入当前标签（保留其他标签的分割数据）
+            for i in range(masks.shape[0]):
+                slice_mask = masks[i]
+                if slice_mask is not None and np.sum(slice_mask > 0) > 0:
+                    self.data_manager.set_mask(i, slice_mask)
             
             # 更新显示
             current_idx = self._get_current_slice_index()
@@ -452,7 +452,7 @@ class SAM2UIController(QObject):
             QMessageBox.information(
                 self.parent_widget,
                 "Success",
-                f"SAM2 volume segmentation completed.\n{len(masks_list)} slices processed."
+                f"SAM2 volume segmentation completed.\n{masks.shape[0]} slices processed."
             )
         else:
             self._on_volume_seg_error("Segmentation returned no result.")

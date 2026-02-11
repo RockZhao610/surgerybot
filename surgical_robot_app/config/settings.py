@@ -20,10 +20,41 @@ logger = get_logger("surgical_robot_app.config.settings")
 
 @dataclass
 class PathPlanningConfig:
-    """路径规划配置"""
-    grid_size: Tuple[int, int, int] = (100, 100, 105)
-    obstacle_expansion: int = 4
+    """
+    路径规划配置
+    
+    包含 RRT、A* 算法参数以及路径简化设置。
+    """
+    # ===== 算法选择 =====
+    use_rrt: bool = True  # True: 使用 RRT, False: 使用 A*
+    use_sdf: bool = True  # True: 使用 SDF 碰撞检测, False: 使用点云
+    
+    # ===== A* 算法参数 =====
+    grid_size: Tuple[int, int, int] = (100, 100, 105)  # A* 网格大小
+    obstacle_expansion: int = 4  # 障碍物膨胀半径
     default_grid_size: Tuple[int, int, int] = (100, 100, 100)  # A* 算法的默认网格大小
+    
+    # ===== RRT 算法参数 =====
+    rrt_step_size: float = 2.0  # RRT 扩展步长
+    rrt_goal_bias: float = 0.1  # 目标偏向概率 (0-1)
+    rrt_max_iterations: int = 5000  # 最大迭代次数
+    rrt_goal_threshold: float = 2.0  # 到达目标的阈值
+    
+    # ===== 安全距离 =====
+    safety_radius: float = 5.0  # 路径点到障碍物的最小安全距离
+    instrument_radius: float = 2.0  # 器械半径（用于体积碰撞检测）
+    
+    # ===== 路径简化 =====
+    simplify_enabled: bool = True  # 是否启用路径简化
+    simplify_max_points: int = 50  # 最大路径点数 (0 表示不限制)
+    simplify_tolerance: float = 1.0  # RDP 简化容差
+    
+    # ===== SDF 参数 =====
+    sdf_use_interpolation: bool = True  # 是否使用三线性插值
+    
+    def get_max_points(self) -> Optional[int]:
+        """获取最大点数，0 返回 None 表示不限制"""
+        return self.simplify_max_points if self.simplify_max_points > 0 else None
 
 
 @dataclass

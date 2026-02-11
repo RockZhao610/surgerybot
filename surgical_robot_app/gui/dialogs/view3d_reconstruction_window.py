@@ -288,6 +288,11 @@ class View3DReconstructionWindow(QDialog):
             new_mapper = vtkPolyDataMapper()
             new_mapper.SetInputData(input_data)
             
+            # 复制 mapper 的标量可见性设置（关键：关闭后才会使用 actor 颜色）
+            source_mapper = source_actor.GetMapper()
+            if source_mapper:
+                new_mapper.SetScalarVisibility(source_mapper.GetScalarVisibility())
+            
             new_actor = vtkActor()
             new_actor.SetMapper(new_mapper)
             
@@ -298,6 +303,8 @@ class View3DReconstructionWindow(QDialog):
                 target_prop.SetColor(source_prop.GetColor())
                 target_prop.SetOpacity(source_prop.GetOpacity())
                 target_prop.SetRepresentation(source_prop.GetRepresentation())
+                target_prop.SetSpecular(source_prop.GetSpecular())
+                target_prop.SetSpecularPower(source_prop.GetSpecularPower())
             
             return new_actor
         except Exception as e:

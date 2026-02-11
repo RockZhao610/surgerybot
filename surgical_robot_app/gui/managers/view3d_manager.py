@@ -154,18 +154,18 @@ class View3DManager(QObject):
     
     @handle_errors(parent_widget=None, show_message=True, context="3D Reconstruction")
     def reconstruct_3d(self, *args):
-        """执行异步 3D 重建"""
+        """执行异步 3D 重建（支持多标签）"""
         logger.info("🔵 reconstruct_3d() 被调用 (异步方式)")
         
         if not VTK_AVAILABLE:
-            error_msg = "VTK 不可用"
+            error_msg = "VTK is not available"
             logger.error(f"❌ {error_msg}")
             if QMessageBox and self.parent_widget:
                 QMessageBox.warning(self.parent_widget, "3D Reconstruction", error_msg)
             return
         
         if self.vtk_renderer is None:
-            error_msg = "VTK 渲染器未初始化"
+            error_msg = "VTK renderer not initialized"
             logger.error(f"❌ {error_msg}")
             if QMessageBox and self.parent_widget:
                 QMessageBox.warning(self.parent_widget, "3D Reconstruction", error_msg)
@@ -173,7 +173,7 @@ class View3DManager(QObject):
         
         volume = self.data_manager.get_volume()
         if volume is None:
-            error_msg = "未加载体积数据，请先导入数据"
+            error_msg = "No volume data loaded. Please import data first."
             if QMessageBox and self.parent_widget:
                 QMessageBox.warning(self.parent_widget, "3D Reconstruction", error_msg)
             return
@@ -190,7 +190,7 @@ class View3DManager(QObject):
                     self.data_manager.set_seg_mask_volume(seg_mask_volume)
             
         if seg_mask_volume is None:
-            error_msg = "未找到分割掩码，请先进行分割操作"
+            error_msg = "No segmentation mask found. Please perform segmentation first."
             if QMessageBox and self.parent_widget:
                 QMessageBox.warning(self.parent_widget, "3D Reconstruction", error_msg)
             return
@@ -212,6 +212,26 @@ class View3DManager(QObject):
             if isinstance(s, (list, tuple)) and len(s) == 3:
                 spacing = (float(s[0]), float(s[1]), float(s[2]))
 
+        # 获取需要重建的标签列表及其颜色
+        import numpy as np
+        unique_labels = np.unique(seg_mask_volume)
+        unique_labels = [int(v) for v in unique_labels if v > 0]
+        
+        if not unique_labels:
+            error_msg = "Segmentation mask is empty. Please perform segmentation first."
+            if QMessageBox and self.parent_widget:
+                QMessageBox.warning(self.parent_widget, "3D Reconstruction", error_msg)
+            if self.btn_recon: self.btn_recon.setEnabled(True)
+            if self.recon_progress: self.recon_progress.setVisible(False)
+            return
+        
+        # 收集标签颜色信息
+        label_colors = {}
+        for label_id in unique_labels:
+            label_colors[label_id] = self.data_manager.get_label_color_float(label_id)
+        
+        logger.info(f"多标签重建: 标签={unique_labels}, 颜色={label_colors}")
+
         # 启动线程
         run_in_thread(
             self,
@@ -220,46 +240,82 @@ class View3DManager(QObject):
             on_error=self._on_reconstruction_error,
             on_progress=self._on_reconstruction_progress,
             vol=seg_mask_volume,
-            spacing=spacing
+            spacing=spacing,
+            label_ids=unique_labels,
+            label_colors=label_colors
         )
 
-    def _reconstruct_3d_task(self, vol, spacing=None, progress_callback=None):
-        """在后台线程执行的重建任务"""
+    def _reconstruct_3d_task(self, vol, spacing=None, label_ids=None, label_colors=None, progress_callback=None):
+        """
+        在后台线程执行的重建任务（支持多标签）
+        
+        对每个标签分别提取二值体、预处理、Marching Cubes
+        """
         import numpy as np
         import cv2
         
-        # 1. 预处理 (二值化 + 填充)
-        vol = vol.astype(np.uint8) if vol.dtype != np.uint8 else vol
-        vol = np.where(vol > 128, 255, 0).astype(np.uint8)
+        # 兼容旧调用（单标签）
+        if label_ids is None:
+            label_ids = [1]
+            vol = np.where(vol > 128, 255, 0).astype(np.uint8)
         
-        filled_vol = np.zeros_like(vol)
-        for z in range(vol.shape[0]):
-            mask = vol[z].copy()
-            if np.sum(mask > 0) == 0:
-                filled_vol[z] = mask
-                continue
-            
-            kernel_size = getattr(self, 'morph_kernel_size', 3)
-            iterations = getattr(self, 'morph_iterations', 1)
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=iterations)
-            
-            enable_contour = getattr(self, 'enable_contour_filling', True)
-            if enable_contour:
-                contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                filled_mask = np.zeros_like(mask)
-                if contours:
-                    cv2.drawContours(filled_mask, contours, -1, 255, thickness=-1)
-                    mask = filled_mask
-            filled_vol[z] = mask
-            
-        # 2. 调用核心重建逻辑
         core_reconstruct_3d = _load_core_reconstruct_3d()
         if core_reconstruct_3d is None:
             raise RuntimeError("Core reconstruction module not available")
-
-        poly, image = core_reconstruct_3d(filled_vol, spacing=spacing, threshold=128, progress_cb=progress_callback)
-        return poly, image
+        
+        results = []  # [(label_id, poly, image, color), ...]
+        total_labels = len(label_ids)
+        
+        for idx, label_id in enumerate(label_ids):
+            # 提取此标签的二值体
+            binary_vol = (vol == label_id).astype(np.uint8) * 255
+            
+            # 检查是否有数据
+            if np.sum(binary_vol > 0) == 0:
+                logger.warning(f"标签 {label_id} 无数据，跳过")
+                continue
+            
+            # 预处理（形态学 + 填充）
+            filled_vol = np.zeros_like(binary_vol)
+            for z in range(binary_vol.shape[0]):
+                mask_slice = binary_vol[z].copy()
+                if np.sum(mask_slice > 0) == 0:
+                    filled_vol[z] = mask_slice
+                    continue
+                
+                kernel_size = getattr(self, 'morph_kernel_size', 3)
+                iterations = getattr(self, 'morph_iterations', 1)
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+                mask_slice = cv2.morphologyEx(mask_slice, cv2.MORPH_CLOSE, kernel, iterations=iterations)
+                
+                enable_contour = getattr(self, 'enable_contour_filling', True)
+                if enable_contour:
+                    contours, _ = cv2.findContours(mask_slice, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    filled_mask = np.zeros_like(mask_slice)
+                    if contours:
+                        cv2.drawContours(filled_mask, contours, -1, 255, thickness=-1)
+                        mask_slice = filled_mask
+                filled_vol[z] = mask_slice
+            
+            # 进度回调
+            def _label_progress(p, _idx=idx, _total=total_labels):
+                if progress_callback:
+                    overall = int((_idx * 100 + p) / _total)
+                    progress_callback(overall)
+            
+            # Marching Cubes
+            poly, image = core_reconstruct_3d(filled_vol, spacing=spacing, threshold=128, progress_cb=_label_progress)
+            
+            color = label_colors.get(label_id, (1.0, 0.3, 0.3)) if label_colors else (1.0, 0.3, 0.3)
+            results.append((label_id, poly, image, color))
+            
+            logger.info(f"标签 {label_id} 重建完成: "
+                        f"points={poly.GetNumberOfPoints() if poly else 0}")
+        
+        if not results:
+            raise RuntimeError("All label reconstructions failed")
+        
+        return results
 
     def _on_reconstruction_progress(self, p):
         """更新进度条"""
@@ -267,52 +323,91 @@ class View3DManager(QObject):
             self.recon_progress.setValue(p)
 
     def _on_reconstruction_finished(self, result):
-        """重建完成后的 UI 更新 (在主线程执行)"""
-        poly, image = result
+        """重建完成后的 UI 更新（支持多标签）"""
+        # result = [(label_id, poly, image, color), ...]
+        results = result
         
-        if poly is None or poly.GetNumberOfPoints() == 0:
-            self._on_reconstruction_error("Empty surface extracted")
+        if not results:
+            self._on_reconstruction_error("Empty results")
             return
-
-        # 后处理 (VTK 过滤器)
-        try:
-            if vtkFillHolesFilter is not None:
-                hole_size = getattr(self, 'vtk_hole_size', 1000.0)
-                fill_holes = vtkFillHolesFilter()
-                fill_holes.SetInputData(poly)
-                fill_holes.SetHoleSize(hole_size)
-                fill_holes.Update()
-                poly = fill_holes.GetOutput()
-        except Exception as e:
-            logger.warning(f"VTK FillHoles failed: {e}")
-
-        # 创建 Actor 并更新视图
-        mapper = vtkPolyDataMapper()
-        normals = vtkPolyDataNormals()
-        normals.SetInputData(poly)
-        normals.SetFeatureAngle(60.0)
-        normals.Update()
-        mapper.SetInputData(normals.GetOutput())
-        mapper.ScalarVisibilityOff()
-        
-        actor = vtkActor()
-        actor.SetMapper(mapper)
-        actor.GetProperty().SetColor(1.0, 0.3, 0.3)
-        actor.GetProperty().SetSpecular(0.5)
-        actor.GetProperty().SetSpecularPower(20.0)
-        
-        outline = vtkOutlineFilter()
-        outline.SetInputData(image)
-        outline.Update()
-        outline_mapper = vtkPolyDataMapper()
-        outline_mapper.SetInputData(outline.GetOutput())
-        outline_actor = vtkActor()
-        outline_actor.SetMapper(outline_mapper)
-        outline_actor.GetProperty().SetColor(1.0, 1.0, 1.0)
         
         self.vtk_renderer.RemoveAllViewProps()
-        self.vtk_renderer.AddActor(actor)
-        self.vtk_renderer.AddActor(outline_actor)
+        
+        total_points = 0
+        first_image = None
+        saved_files = []
+        
+        for label_id, poly, image, color in results:
+            if poly is None or poly.GetNumberOfPoints() == 0:
+                logger.warning(f"标签 {label_id} 表面为空，跳过")
+                continue
+            
+            if first_image is None:
+                first_image = image
+            
+            # 后处理 (VTK 过滤器)
+            try:
+                if vtkFillHolesFilter is not None:
+                    hole_size = getattr(self, 'vtk_hole_size', 1000.0)
+                    fill_holes = vtkFillHolesFilter()
+                    fill_holes.SetInputData(poly)
+                    fill_holes.SetHoleSize(hole_size)
+                    fill_holes.Update()
+                    poly = fill_holes.GetOutput()
+            except Exception as e:
+                logger.warning(f"VTK FillHoles failed for label {label_id}: {e}")
+
+            # 创建 Actor
+            mapper = vtkPolyDataMapper()
+            normals = vtkPolyDataNormals()
+            normals.SetInputData(poly)
+            normals.SetFeatureAngle(60.0)
+            normals.Update()
+            mapper.SetInputData(normals.GetOutput())
+            mapper.ScalarVisibilityOff()
+            
+            actor = vtkActor()
+            actor.SetMapper(mapper)
+            actor.GetProperty().SetColor(*color)
+            actor.GetProperty().SetSpecular(0.5)
+            actor.GetProperty().SetSpecularPower(20.0)
+            
+            self.vtk_renderer.AddActor(actor)
+            total_points += poly.GetNumberOfPoints()
+            
+            # 保存 STL 文件
+            try:
+                result_dir = Path(__file__).resolve().parent.parent.parent / "3d_recon" / "result"
+                result_dir.mkdir(parents=True, exist_ok=True)
+                label_name = self.data_manager.label_names.get(label_id, f"label_{label_id}")
+                # 清理文件名中的非法字符
+                safe_name = "".join(c if c.isalnum() or c in ('_', '-') else '_' for c in label_name)
+                out_path = result_dir / f"model_{safe_name}_{int(time.time())}.stl"
+                from vtkmodules.vtkIOGeometry import vtkSTLWriter
+                writer = vtkSTLWriter()
+                writer.SetInputData(poly)
+                writer.SetFileName(str(out_path))
+                writer.Write()
+                saved_files.append(str(out_path))
+                logger.info(f"Saved label {label_id}: {out_path}")
+            except Exception as e:
+                logger.warning(f"Failed to save STL for label {label_id}: {e}")
+        
+        # 添加体积轮廓线
+        if first_image is not None:
+            try:
+                outline = vtkOutlineFilter()
+                outline.SetInputData(first_image)
+                outline.Update()
+                outline_mapper = vtkPolyDataMapper()
+                outline_mapper.SetInputData(outline.GetOutput())
+                outline_actor = vtkActor()
+                outline_actor.SetMapper(outline_mapper)
+                outline_actor.GetProperty().SetColor(1.0, 1.0, 1.0)
+                self.vtk_renderer.AddActor(outline_actor)
+            except Exception as e:
+                logger.warning(f"Failed to create outline: {e}")
+        
         self.vtk_renderer.ResetCamera()
         
         if self.coordinate_system:
@@ -321,27 +416,14 @@ class View3DManager(QObject):
             
         self.update_display()
         
+        label_count = len([r for r in results if r[1] is not None and r[1].GetNumberOfPoints() > 0])
         if self.vtk_status:
-            self.vtk_status.setText(f"Render complete: {poly.GetNumberOfPoints()} points")
-        
-        # 保存 STL 文件
-        try:
-            result_dir = Path(__file__).resolve().parent.parent.parent / "3d_recon" / "result"
-            result_dir.mkdir(parents=True, exist_ok=True)
-            out_path = result_dir / f"model_{int(time.time())}.stl"
-            from vtkmodules.vtkIOGeometry import vtkSTLWriter
-            writer = vtkSTLWriter()
-            writer.SetInputData(poly)
-            writer.SetFileName(str(out_path))
-            writer.Write()
-            logger.info(f"Saved: {out_path}")
-        except Exception as e:
-            logger.warning(f"Failed to save STL: {e}")
+            self.vtk_status.setText(f"Render complete: {label_count} labels, {total_points} points")
 
         if self.btn_recon: self.btn_recon.setEnabled(True)
         if self.recon_progress: self.recon_progress.setVisible(False)
         
-        # 触发主界面的同步 (由于 MainView 持有 View3DManager 引用并连接了 reconstruction_window)
+        # 触发主界面的同步
         if hasattr(self.parent_widget, '_sync_to_reconstruction_window'):
             self.parent_widget._sync_to_reconstruction_window()
 

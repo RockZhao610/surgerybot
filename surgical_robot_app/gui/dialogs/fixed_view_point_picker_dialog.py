@@ -232,7 +232,7 @@ class FixedViewPointPickerDialog(QDialog):
                 mapper.SetInputData(poly_data)
                 actor = vtkActor()
                 actor.SetMapper(mapper)
-                actor.GetProperty().SetColor(0.3, 0.6, 1.0)
+                actor.GetProperty().SetColor(1.0, 0.3, 0.3)
                 self.axial_renderer.AddActor(actor)
             
             # 冠状视图
@@ -241,7 +241,7 @@ class FixedViewPointPickerDialog(QDialog):
                 mapper.SetInputData(poly_data)
                 actor = vtkActor()
                 actor.SetMapper(mapper)
-                actor.GetProperty().SetColor(0.3, 0.6, 1.0)
+                actor.GetProperty().SetColor(1.0, 0.3, 0.3)
                 self.coronal_renderer.AddActor(actor)
         except Exception as e:
             logger.error(f"复制模型到视角时出错: {e}") if logger else None

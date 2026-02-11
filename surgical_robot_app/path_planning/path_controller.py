@@ -4,13 +4,15 @@ PathController: 路径规划控制器
 职责：
 - 管理路径规划相关的数据（起点/终点/中间点、最终路径点）
 - 支持 A* 和 RRT 两种路径规划算法
-- 维护障碍物数据（栅格或点云）
+- 维护障碍物数据（栅格、点云或 SDF）
+- 支持 SDF (Signed Distance Field) 碰撞检测，解决点云内部空洞问题
 
 注意：
 - 不依赖 Qt，仅依赖路径规划器和 numpy，方便单元测试与复用。
+- 可以通过 config.json 配置所有参数
 """
 
-from typing import List, Tuple, Optional, Callable
+from typing import List, Tuple, Optional, Callable, Union, TYPE_CHECKING
 
 import numpy as np
 import logging
@@ -26,6 +28,11 @@ try:
         volume_to_point_cloud,
         mesh_to_point_cloud,
     )
+    from surgical_robot_app.path_planning.sdf_utils import (
+        SDFCollisionChecker,
+        compute_sdf_from_mask,
+        create_sdf_collision_checker,
+    )
 except ImportError:
     from path_planning.a_star_planner import (
         AStarPlanner,
@@ -37,6 +44,18 @@ except ImportError:
         volume_to_point_cloud,
         mesh_to_point_cloud,
     )
+    from path_planning.sdf_utils import (
+        SDFCollisionChecker,
+        compute_sdf_from_mask,
+        create_sdf_collision_checker,
+    )
+
+# 类型检查时导入配置类型
+if TYPE_CHECKING:
+    from surgical_robot_app.config.settings import PathPlanningConfig
+
+# 碰撞检测器类型（兼容点云和 SDF）
+CollisionCheckerType = Union[PointCloudCollisionChecker, SDFCollisionChecker, None]
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +63,14 @@ SpacePoint = Tuple[float, float, float]  # (x, y, z) in [0, 100]
 
 
 class PathController:
+    """
+    路径规划控制器
+    
+    支持两种创建方式：
+    1. 直接传参: PathController(use_rrt=True, ...)
+    2. 从配置创建: PathController.from_config() 或 PathController.from_config(config)
+    """
+    
     def __init__(
         self,
         planner: Optional[AStarPlanner] = None,
@@ -52,6 +79,7 @@ class PathController:
         use_rrt: bool = True,  # 默认使用RRT
         rrt_step_size: float = 2.0,
         rrt_safety_radius: float = 5.0,  # 增加默认安全半径从3.0到5.0
+        use_sdf: bool = True,  # 默认使用 SDF 碰撞检测（解决内部空洞问题）
     ):
         """
         初始化路径规划控制器
@@ -63,8 +91,12 @@ class PathController:
             use_rrt: 是否使用RRT算法（True）还是A*算法（False）
             rrt_step_size: RRT步长
             rrt_safety_radius: RRT安全半径
+            use_sdf: 是否使用 SDF（有符号距离场）进行碰撞检测
+                     - True: 使用 SDF，完美区分内外，解决点云内部空洞问题
+                     - False: 使用传统点云方式
         """
         self.use_rrt = use_rrt
+        self.use_sdf = use_sdf
         self.grid_size = grid_size
         self.obstacle_expansion = obstacle_expansion
         
@@ -78,6 +110,11 @@ class PathController:
         
         self.rrt_step_size = rrt_step_size
         self.rrt_safety_radius = rrt_safety_radius
+        
+        # 路径简化参数
+        self.path_simplify_enabled: bool = True  # 是否启用路径简化
+        self.path_max_points: Optional[int] = 50  # 最大路径点数（None 表示不限制）
+        self.path_simplify_tolerance: float = 1.0  # 简化容差（点到直线的最大偏离）
 
         self.start_point: Optional[SpacePoint] = None
         self.end_point: Optional[SpacePoint] = None
@@ -87,14 +124,13 @@ class PathController:
         # 撤销/重做栈
         self.undo_stack: List[dict] = []
         self.redo_stack: List[dict] = []
-        
-        # 保存初始状态
-        self._save_state()
 
         # 障碍物数据（根据算法类型使用不同的格式）
         self._obstacle_grid: Optional[np.ndarray] = None  # A*使用
-        self._point_cloud: Optional[np.ndarray] = None  # RRT使用
-        self._collision_checker: Optional[PointCloudCollisionChecker] = None  # RRT使用
+        self._point_cloud: Optional[np.ndarray] = None  # RRT点云使用
+        self._sdf: Optional[np.ndarray] = None  # SDF 数据
+        self._sdf_metadata: Optional[dict] = None  # SDF 元数据
+        self._collision_checker: CollisionCheckerType = None  # 碰撞检测器（点云或SDF）
         
         # 物理坐标相关（用于体数据：单位mm）
         self._use_physical_coords: bool = False
@@ -102,6 +138,62 @@ class PathController:
         self._volume_spacing: Optional[Tuple[float, float, float]] = None
         self._space_bounds_physical: Optional[Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]]] = None
         self._physical_path_points: List[SpacePoint] = []
+        
+        # 保存初始状态
+        self._save_state()
+    
+    @classmethod
+    def from_config(cls, config: Optional['PathPlanningConfig'] = None) -> 'PathController':
+        """
+        从配置文件创建 PathController 实例
+        
+        Args:
+            config: PathPlanningConfig 实例，如果为 None 则从全局配置获取
+        
+        Returns:
+            PathController 实例
+        
+        示例:
+            # 使用全局配置（从 config.json 加载）
+            controller = PathController.from_config()
+            
+            # 使用自定义配置
+            from surgical_robot_app.config.settings import PathPlanningConfig
+            config = PathPlanningConfig(use_rrt=True, safety_radius=8.0)
+            controller = PathController.from_config(config)
+        """
+        if config is None:
+            # 从全局配置获取
+            try:
+                from surgical_robot_app.config.settings import get_config
+                app_config = get_config()
+                config = app_config.path_planning
+            except ImportError:
+                from config.settings import get_config
+                app_config = get_config()
+                config = app_config.path_planning
+        
+        # 创建实例
+        instance = cls(
+            grid_size=config.grid_size,
+            obstacle_expansion=config.obstacle_expansion,
+            use_rrt=config.use_rrt,
+            rrt_step_size=config.rrt_step_size,
+            rrt_safety_radius=config.safety_radius,
+            use_sdf=config.use_sdf,
+        )
+        
+        # 设置路径简化参数
+        instance.path_simplify_enabled = config.simplify_enabled
+        instance.path_max_points = config.get_max_points()
+        instance.path_simplify_tolerance = config.simplify_tolerance
+        
+        logger.info(f"从配置创建 PathController: "
+                    f"use_rrt={config.use_rrt}, use_sdf={config.use_sdf}, "
+                    f"safety_radius={config.safety_radius}, "
+                    f"simplify_max_points={config.simplify_max_points}")
+        
+        return instance
 
     # -------------------- 路径点管理 --------------------
 
@@ -212,6 +304,37 @@ class PathController:
         self.waypoints = []
         self.path_points = []
         self._save_state()
+    
+    def set_path_simplification(
+        self,
+        enabled: bool = True,
+        max_points: Optional[int] = 50,
+        tolerance: float = 1.0
+    ) -> None:
+        """
+        配置路径简化参数
+        
+        Args:
+            enabled: 是否启用路径简化
+            max_points: 最大路径点数（None 表示不限制）
+                        较小的值 = 更少的点，但可能丢失细节
+            tolerance: RDP 简化容差（点到直线的最大偏离距离）
+                       较大的值 = 更激进的简化
+        
+        示例:
+            # 只保留 20 个点
+            controller.set_path_simplification(max_points=20)
+            
+            # 禁用简化（保留所有点）
+            controller.set_path_simplification(enabled=False)
+            
+            # 激进简化
+            controller.set_path_simplification(max_points=10, tolerance=3.0)
+        """
+        self.path_simplify_enabled = enabled
+        self.path_max_points = max_points
+        self.path_simplify_tolerance = tolerance
+        logger.info(f"路径简化配置: enabled={enabled}, max_points={max_points}, tolerance={tolerance}")
 
     # -------------------- 障碍物数据管理 --------------------
 
@@ -221,14 +344,14 @@ class PathController:
         spacing: Optional[Tuple[float, float, float]] = None
     ) -> Optional[np.ndarray]:
         """
-        从 3D 分割体数据生成障碍物数据（点云或栅格）
+        从 3D 分割体数据生成障碍物数据（SDF、点云或栅格）
 
         Args:
             seg_mask_volume: 3D 掩码体数据 (Z, H, W)
-            spacing: 体素间距（可选，用于点云生成）
+            spacing: 体素间距（可选，用于物理坐标转换）
 
         Returns:
-            如果使用RRT，返回点云数组；如果使用A*，返回障碍物栅格
+            如果使用 SDF/RRT，返回 SDF 或点云数组；如果使用 A*，返回障碍物栅格
         """
         # 记录体数据物理信息（用于坐标转换）
         if spacing is not None and seg_mask_volume is not None:
@@ -245,36 +368,11 @@ class PathController:
                 self.a_star_planner.space_bounds = None
 
         if self.use_rrt:
-            # 使用RRT：生成点云
-            point_cloud = volume_to_point_cloud(
-                seg_mask_volume,
-                threshold=128,
-                downsample_factor=1,  # 减少下采样，增加点云密度以提高碰撞检测精度
-                spacing=spacing
-            )
-            self._point_cloud = point_cloud
-            
-            # 创建碰撞检测器，使用更大的安全半径
-            # 确保路径不会穿过物体表面
-            effective_safety_radius = max(self.rrt_safety_radius, 5.0)  # 至少5.0的安全半径
-            
-            self._collision_checker = PointCloudCollisionChecker(
-                point_cloud,
-                safety_radius=effective_safety_radius
-            )
-            
-            # 创建RRT规划器
-            self.rrt_planner = RRTPlanner(
-                self._collision_checker,
-                step_size=self.rrt_step_size,
-                goal_bias=0.1,
-                max_iterations=5000,
-                goal_threshold=2.0,
-                bounds=self._space_bounds_physical if self._use_physical_coords else None,
-            )
-            
-            logger.info(f"RRT障碍物设置完成: {len(point_cloud)} 个点")
-            return point_cloud
+            # 根据 use_sdf 选择碰撞检测方式
+            if self.use_sdf:
+                return self._set_obstacle_from_volume_sdf(seg_mask_volume, spacing)
+            else:
+                return self._set_obstacle_from_volume_pointcloud(seg_mask_volume, spacing)
         else:
             # 使用A*：生成栅格
             obstacle_grid = create_obstacle_grid(
@@ -286,16 +384,182 @@ class PathController:
             self.a_star_planner.set_obstacle_grid(obstacle_grid)
             logger.info(f"A*障碍物栅格设置完成: {obstacle_grid.shape}")
             return obstacle_grid
+    
+    def _set_obstacle_from_volume_sdf(
+        self,
+        seg_mask_volume: np.ndarray,
+        spacing: Optional[Tuple[float, float, float]] = None
+    ) -> np.ndarray:
+        """
+        使用 SDF（有符号距离场）设置障碍物
+        
+        SDF 的优势：
+        1. 完美区分内部/外部，不存在内部空洞问题
+        2. 直接获取精确距离，无需最近邻搜索
+        3. 支持三线性插值，检测更平滑
+        
+        Args:
+            seg_mask_volume: 3D 掩码体数据 (Z, H, W)
+            spacing: 体素间距
+        
+        Returns:
+            SDF 数组
+        """
+        effective_safety_radius = max(self.rrt_safety_radius, 5.0)
+        
+        # 计算 SDF
+        sdf, metadata = compute_sdf_from_mask(
+            seg_mask_volume,
+            spacing=spacing,
+            normalize_to_100=(spacing is None)
+        )
+        
+        self._sdf = sdf
+        self._sdf_metadata = metadata
+        
+        # 创建 SDF 碰撞检测器
+        self._collision_checker = SDFCollisionChecker(
+            sdf=sdf,
+            metadata=metadata,
+            safety_radius=effective_safety_radius,
+            use_interpolation=True  # 使用三线性插值提高精度
+        )
+        
+        # 创建 RRT 规划器
+        self.rrt_planner = RRTPlanner(
+            self._collision_checker,
+            step_size=self.rrt_step_size,
+            goal_bias=0.1,
+            max_iterations=5000,
+            goal_threshold=2.0,
+            bounds=self._space_bounds_physical if self._use_physical_coords else None,
+        )
+        
+        logger.info(f"SDF 障碍物设置完成: shape={sdf.shape}, "
+                    f"range=[{metadata['sdf_range'][0]:.2f}, {metadata['sdf_range'][1]:.2f}], "
+                    f"safety_radius={effective_safety_radius}")
+        
+        return sdf
+    
+    def _set_obstacle_from_volume_pointcloud(
+        self,
+        seg_mask_volume: np.ndarray,
+        spacing: Optional[Tuple[float, float, float]] = None
+    ) -> np.ndarray:
+        """
+        使用传统点云方式设置障碍物（原有实现）
+        
+        Args:
+            seg_mask_volume: 3D 掩码体数据 (Z, H, W)
+            spacing: 体素间距
+        
+        Returns:
+            点云数组
+        """
+        # 生成点云
+        point_cloud = volume_to_point_cloud(
+            seg_mask_volume,
+            threshold=128,
+            downsample_factor=1,
+            spacing=spacing
+        )
+        self._point_cloud = point_cloud
+        
+        # 创建碰撞检测器
+        effective_safety_radius = max(self.rrt_safety_radius, 5.0)
+        
+        self._collision_checker = PointCloudCollisionChecker(
+            point_cloud,
+            safety_radius=effective_safety_radius
+        )
+        
+        # 创建 RRT 规划器
+        self.rrt_planner = RRTPlanner(
+            self._collision_checker,
+            step_size=self.rrt_step_size,
+            goal_bias=0.1,
+            max_iterations=5000,
+            goal_threshold=2.0,
+            bounds=self._space_bounds_physical if self._use_physical_coords else None,
+        )
+        
+        logger.info(f"点云障碍物设置完成: {len(point_cloud)} 个点")
+        return point_cloud
+    
+    def _create_sdf_from_mesh(self, poly_data) -> Tuple[Optional[np.ndarray], Optional[dict]]:
+        """
+        从 VTK 网格创建 SDF（通过体素化）
+        
+        Args:
+            poly_data: VTK PolyData 对象
+        
+        Returns:
+            (sdf, metadata) 元组
+        """
+        try:
+            from vtkmodules.vtkFiltersCore import vtkImplicitPolyDataDistance
+        except ImportError:
+            logger.warning("VTK vtkImplicitPolyDataDistance 不可用")
+            return None, None
+        
+        # 获取网格边界
+        bounds = poly_data.GetBounds()  # (xmin, xmax, ymin, ymax, zmin, zmax)
+        
+        # 计算网格尺寸（归一化到 0-100 空间）
+        x_range = bounds[1] - bounds[0]
+        y_range = bounds[3] - bounds[2]
+        z_range = bounds[5] - bounds[4]
+        max_range = max(x_range, y_range, z_range)
+        
+        # 体素化分辨率（每个维度的体素数）
+        resolution = 100
+        
+        # 创建隐式距离函数
+        implicit_distance = vtkImplicitPolyDataDistance()
+        implicit_distance.SetInput(poly_data)
+        
+        # 创建 SDF 数组
+        sdf = np.zeros((resolution, resolution, resolution), dtype=np.float32)
+        
+        # 计算每个体素的 SDF 值
+        for k in range(resolution):
+            z = bounds[4] + (k / (resolution - 1)) * z_range
+            for j in range(resolution):
+                y = bounds[2] + (j / (resolution - 1)) * y_range
+                for i in range(resolution):
+                    x = bounds[0] + (i / (resolution - 1)) * x_range
+                    # VTK 的隐式距离：负值在内部，正值在外部
+                    sdf[k, j, i] = implicit_distance.EvaluateFunction(x, y, z)
+        
+        # 不需要归一化 SDF 值，保持原始物理距离
+        # sdf 值已经是在原始坐标空间中的距离
+        
+        # 创建元数据（使用原始世界坐标，与 VTK 场景对齐）
+        metadata = {
+            'bounds': {
+                'x': (bounds[0], bounds[1]),  # 原始 X 边界
+                'y': (bounds[2], bounds[3]),  # 原始 Y 边界
+                'z': (bounds[4], bounds[5]),  # 原始 Z 边界
+            },
+            'spacing': (x_range / resolution, y_range / resolution, z_range / resolution),
+            'sdf_range': (float(sdf.min()), float(sdf.max())),
+            'original_bounds': bounds,
+        }
+        
+        logger.info(f"从网格创建 SDF: shape={sdf.shape}, "
+                    f"bounds=({bounds[0]:.1f}-{bounds[1]:.1f}, {bounds[2]:.1f}-{bounds[3]:.1f}, {bounds[4]:.1f}-{bounds[5]:.1f}), "
+                    f"range=[{sdf.min():.2f}, {sdf.max():.2f}]")
+        return sdf, metadata
 
     def set_obstacle_from_mesh(self, poly_data) -> Optional[np.ndarray]:
         """
-        从网格（VTK PolyData）生成点云障碍物（仅用于RRT）
+        从网格（VTK PolyData）生成障碍物数据（支持 SDF 和点云）
 
         Args:
             poly_data: VTK PolyData 对象
 
         Returns:
-            点云数组
+            点云数组或 SDF 数据
         """
         if not self.use_rrt:
             logger.warning("set_obstacle_from_mesh 仅支持RRT算法")
@@ -312,11 +576,34 @@ class PathController:
         
         self._point_cloud = point_cloud
         
-        # STL模型使用更大的安全半径，确保路径不会穿过物体
-        # 安全半径应该足够大，以考虑路径点的体积和误差
-        # 增加安全半径到5.0，确保路径有足够的安全距离
-        mesh_safety_radius = 5.0  # 从3.0增加到5.0，确保有足够的安全距离
+        # STL模型使用更大的安全半径
+        mesh_safety_radius = self.rrt_safety_radius
         
+        # 如果使用 SDF，尝试从网格创建 SDF
+        if self.use_sdf:
+            try:
+                sdf, metadata = self._create_sdf_from_mesh(poly_data)
+                if sdf is not None:
+                    self._sdf = sdf
+                    self._sdf_metadata = metadata
+                    self._collision_checker = SDFCollisionChecker(
+                        sdf, metadata, safety_radius=mesh_safety_radius
+                    )
+                    logger.info(f"从 STL 网格创建 SDF 碰撞检测器: shape={sdf.shape}")
+                    
+                    # 初始化 RRT 规划器
+                    self.rrt_planner = RRTPlanner(
+                        self._collision_checker,
+                        step_size=3.0,
+                        goal_bias=0.2,
+                        max_iterations=15000,
+                        goal_threshold=self.rrt_step_size
+                    )
+                    return sdf
+            except Exception as e:
+                logger.warning(f"从网格创建 SDF 失败，回退到点云: {e}")
+        
+        # 回退到点云碰撞检测
         self._collision_checker = PointCloudCollisionChecker(
             point_cloud,
             safety_radius=mesh_safety_radius
@@ -382,9 +669,72 @@ class PathController:
     def has_obstacle_data(self) -> bool:
         """检查是否已设置障碍物数据"""
         if self.use_rrt:
-            return self._point_cloud is not None and len(self._point_cloud) > 0
+            if self.use_sdf:
+                # 检查 SDF 数据
+                return self._sdf is not None and self._sdf.size > 0
+            else:
+                # 检查点云数据
+                return self._point_cloud is not None and len(self._point_cloud) > 0
         else:
             return self._obstacle_grid is not None
+    
+    def get_collision_checker_type(self) -> str:
+        """获取当前使用的碰撞检测器类型"""
+        if self._collision_checker is None:
+            return "none"
+        elif isinstance(self._collision_checker, SDFCollisionChecker):
+            return "sdf"
+        elif isinstance(self._collision_checker, PointCloudCollisionChecker):
+            return "pointcloud"
+        else:
+            return "unknown"
+    
+    def check_instrument_collision(
+        self,
+        instrument_radius: float = 2.0
+    ) -> Tuple[bool, List[int], float]:
+        """
+        检查当前路径是否对给定半径的器械安全
+        
+        考虑器械的实际体积，而不仅仅是路径线
+        
+        Args:
+            instrument_radius: 器械半径
+        
+        Returns:
+            (is_safe, collision_segments, max_safe_radius):
+            - is_safe: 路径是否安全
+            - collision_segments: 碰撞发生的路径段索引
+            - max_safe_radius: 该路径允许的最大器械半径
+        """
+        if not self._path_points or len(self._path_points) < 2:
+            return True, [], 0.0
+        
+        # 使用规划空间的坐标
+        path = self.get_planner_path_points()
+        if not path:
+            path = self._path_points
+        
+        # 如果是 SDF 检测器，使用器械碰撞检测
+        if isinstance(self._collision_checker, SDFCollisionChecker):
+            is_safe, collision_indices = self._collision_checker.is_path_safe_for_instrument(
+                path, instrument_radius
+            )
+            max_radius = self._collision_checker.get_min_safe_radius(path)
+            return is_safe, collision_indices, max_radius
+        
+        # 点云检测器：简单检查每个点
+        collision_indices = []
+        min_distance = float('inf')
+        
+        for i, point in enumerate(path):
+            if self._collision_checker is not None:
+                dist = self._collision_checker.get_distance_to_obstacle(point)
+                min_distance = min(min_distance, dist)
+                if dist < instrument_radius:
+                    collision_indices.append(i)
+        
+        return len(collision_indices) == 0, collision_indices, max(0, min_distance)
 
     # -------------------- 路径规划 --------------------
 
@@ -403,7 +753,12 @@ class PathController:
         logger.info(f"build_waypoint_list 返回 {len(waypoints)} 个关键点: {waypoints}")
         return waypoints
 
-    def generate_path(self, smooth: bool = True, progress_callback: Optional[Callable[[int], None]] = None) -> List[SpacePoint]:
+    def generate_path(
+        self,
+        smooth: bool = True,
+        progress_callback: Optional[Callable[[int], None]] = None,
+        tree_callback: Optional[Callable[[dict], None]] = None
+    ) -> List[SpacePoint]:
         """
         生成多段路径（起点 -> 中间点... -> 终点），并保存到 self.path_points
 
@@ -430,7 +785,11 @@ class PathController:
         if self.use_rrt:
             if self.rrt_planner is None:
                 raise RuntimeError("RRT planner not initialized")
-            path = self.rrt_planner.plan_multi_segment(planner_waypoints, smooth=smooth, progress_callback=progress_callback)
+            path = self.rrt_planner.plan_multi_segment(
+                planner_waypoints, smooth=smooth,
+                progress_callback=progress_callback,
+                tree_callback=tree_callback
+            )
             if path is None or len(path) == 0:
                 raise RuntimeError("RRT planner returned empty path")
         else:
@@ -461,12 +820,15 @@ class PathController:
     def _postprocess_path(self, path: List[SpacePoint]) -> List[SpacePoint]:
         """
         对路径执行统一后处理：
-        1) 重采样到固定步长
-        2) 在可用时进行平滑并做碰撞复验
-        3) 保持起点/中间点/终点不被移动
+        1) 路径简化（去除不必要的中间点）
+        2) 可选的重采样
+        3) 平滑并做碰撞复验
+        4) 保持起点/中间点/终点不被移动
         """
         if not path or len(path) < 2:
             return path
+        
+        logger.debug(f"后处理开始: 原始路径 {len(path)} 个点")
 
         # 以关键点（起点/中间点/终点）为锚点分段处理，确保关键点不漂移
         anchors = self.build_waypoint_list()
@@ -500,36 +862,59 @@ class PathController:
         if len(cleaned_indices) < 2:
             return path
 
+        # 计算每段允许的最大点数
+        num_segments = len(cleaned_indices) - 1
+        max_points_per_segment = None
+        if self.path_max_points is not None:
+            max_points_per_segment = max(3, self.path_max_points // num_segments)
+
         # 分段处理
         processed: List[SpacePoint] = []
-        for i in range(len(cleaned_indices) - 1):
+        for i in range(num_segments):
             s_idx = cleaned_indices[i]
             e_idx = cleaned_indices[i + 1]
             segment = path[s_idx:e_idx + 1]
             if len(segment) < 2:
                 continue
 
-            # 1) 重采样（沿路径弧长等距插值）
-            step = self.rrt_step_size if self.use_rrt else 2.0
-            resampled = self._resample_path(segment, step_size=step)
+            # 1) 路径简化（如果启用）
+            if self.path_simplify_enabled and len(segment) > 3:
+                # 先用碰撞检测简化（保证安全）
+                if self._collision_checker is not None:
+                    segment = self._simplify_path_by_collision(segment)
+                # 再用 RDP 算法简化（控制点数）
+                if len(segment) > max_points_per_segment if max_points_per_segment else 10:
+                    segment = self._simplify_path_rdp(segment, tolerance=self.path_simplify_tolerance)
 
-            # 2) 平滑 + 碰撞复验（仅在有碰撞检测器时）
-            smoothed = resampled
-            if self._collision_checker is not None:
-                smoothed = self._smooth_path_moving_average(resampled, window_size=3)
+            # 2) 如果简化后点数仍然太多，进行重采样
+            if max_points_per_segment and len(segment) > max_points_per_segment:
+                segment = self._resample_path(segment, step_size=self.rrt_step_size, max_points=max_points_per_segment)
+
+            # 3) 平滑 + 碰撞复验（仅在有碰撞检测器时）
+            smoothed = segment
+            if self._collision_checker is not None and len(segment) > 2:
+                smoothed = self._smooth_path_moving_average(segment, window_size=3)
                 if not self._is_path_collision_free(smoothed, self._collision_checker):
-                    smoothed = resampled
+                    smoothed = segment
 
-            # 3) 拼接（避免重复点）
+            # 4) 拼接（避免重复点）
             if processed:
                 processed.extend(smoothed[1:])
             else:
                 processed.extend(smoothed)
 
+        logger.info(f"后处理完成: {len(path)} -> {len(processed)} 个点")
         return processed if processed else path
 
-    def _resample_path(self, path: List[SpacePoint], step_size: float = 2.0) -> List[SpacePoint]:
-        """沿路径弧长进行等距重采样，保持首尾不变。"""
+    def _resample_path(self, path: List[SpacePoint], step_size: float = 2.0, max_points: Optional[int] = None) -> List[SpacePoint]:
+        """
+        沿路径弧长进行等距重采样，保持首尾不变。
+        
+        Args:
+            path: 原始路径点列表
+            step_size: 采样步长
+            max_points: 最大点数限制（可选），如果设置会自动调整步长
+        """
         if len(path) < 2:
             return path
 
@@ -540,8 +925,14 @@ class PathController:
         if total_len <= 1e-6:
             return path
 
-        # 目标采样点数
+        # 计算目标采样点数
         num_samples = max(2, int(total_len / max(step_size, 1e-6)) + 1)
+        
+        # 如果设置了最大点数限制，调整采样数
+        if max_points is not None and num_samples > max_points:
+            num_samples = max(2, max_points)
+            logger.debug(f"路径重采样: 限制点数从 {int(total_len / step_size) + 1} 到 {num_samples}")
+        
         target_dists = np.linspace(0.0, total_len, num_samples)
 
         # 累计弧长
@@ -581,10 +972,107 @@ class PathController:
             smoothed.append((float(avg[0]), float(avg[1]), float(avg[2])))
         smoothed.append(path[-1])
         return smoothed
+    
+    def _simplify_path_rdp(self, path: List[SpacePoint], tolerance: float = 1.0) -> List[SpacePoint]:
+        """
+        使用 Ramer-Douglas-Peucker 算法简化路径
+        
+        该算法会保留路径的整体形状，同时去除不必要的中间点。
+        
+        Args:
+            path: 原始路径点列表
+            tolerance: 简化容差，点到直线的最大允许偏离距离
+                       较大的值 = 更少的点，但可能偏离原路径更多
+        
+        Returns:
+            简化后的路径
+        """
+        if len(path) <= 2:
+            return path
+        
+        def point_line_distance(point: np.ndarray, line_start: np.ndarray, line_end: np.ndarray) -> float:
+            """计算点到线段的距离"""
+            line_vec = line_end - line_start
+            line_len = np.linalg.norm(line_vec)
+            if line_len < 1e-10:
+                return np.linalg.norm(point - line_start)
+            
+            # 投影参数 t
+            t = max(0, min(1, np.dot(point - line_start, line_vec) / (line_len ** 2)))
+            projection = line_start + t * line_vec
+            return np.linalg.norm(point - projection)
+        
+        def rdp_recursive(points: np.ndarray, start: int, end: int, tolerance: float) -> List[int]:
+            """递归实现 RDP 算法"""
+            if end <= start + 1:
+                return [start]
+            
+            # 找到距离首尾连线最远的点
+            max_dist = 0.0
+            max_idx = start
+            line_start = points[start]
+            line_end = points[end]
+            
+            for i in range(start + 1, end):
+                dist = point_line_distance(points[i], line_start, line_end)
+                if dist > max_dist:
+                    max_dist = dist
+                    max_idx = i
+            
+            # 如果最大距离超过容差，递归处理两段
+            if max_dist > tolerance:
+                left = rdp_recursive(points, start, max_idx, tolerance)
+                right = rdp_recursive(points, max_idx, end, tolerance)
+                return left + right
+            else:
+                return [start]
+        
+        points_array = np.array(path)
+        indices = rdp_recursive(points_array, 0, len(path) - 1, tolerance)
+        indices.append(len(path) - 1)  # 确保包含终点
+        
+        simplified = [path[i] for i in indices]
+        logger.debug(f"RDP 路径简化: {len(path)} -> {len(simplified)} 点 (容差={tolerance})")
+        return simplified
+    
+    def _simplify_path_by_collision(self, path: List[SpacePoint]) -> List[SpacePoint]:
+        """
+        基于碰撞检测的路径简化
+        
+        尝试跳过中间点，只保留必要的转折点。
+        这种方法保证简化后的路径仍然是安全的。
+        
+        Args:
+            path: 原始路径点列表
+        
+        Returns:
+            简化后的路径
+        """
+        if len(path) <= 2 or self._collision_checker is None:
+            return path
+        
+        simplified = [path[0]]
+        current_idx = 0
+        
+        while current_idx < len(path) - 1:
+            # 尝试直接连接到尽可能远的点
+            best_next = current_idx + 1
+            
+            # 从末尾向前搜索，找到可以直接连接的最远点
+            for next_idx in range(len(path) - 1, current_idx + 1, -1):
+                if self._collision_checker.is_path_collision_free(path[current_idx], path[next_idx]):
+                    best_next = next_idx
+                    break
+            
+            simplified.append(path[best_next])
+            current_idx = best_next
+        
+        logger.debug(f"碰撞检测路径简化: {len(path)} -> {len(simplified)} 点")
+        return simplified
 
-    def _is_path_collision_free(self, path: List[SpacePoint], collision_checker: PointCloudCollisionChecker) -> bool:
-        """路径全段碰撞复验。"""
-        if len(path) < 2:
+    def _is_path_collision_free(self, path: List[SpacePoint], collision_checker: CollisionCheckerType) -> bool:
+        """路径全段碰撞复验（支持点云和 SDF 碰撞检测器）。"""
+        if len(path) < 2 or collision_checker is None:
             return True
         for i in range(len(path) - 1):
             if not collision_checker.is_path_collision_free(path[i], path[i + 1]):

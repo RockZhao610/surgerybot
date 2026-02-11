@@ -117,6 +117,40 @@ class SliceEditorController(QObject):
         self.on_sam2_click: Optional[Callable] = None
         self.on_exit_sam2_picking: Optional[Callable] = None  # 退出 SAM2 picking 模式的回调
     
+    def _apply_multilabel_overlay(self, base_img: np.ndarray, mask: np.ndarray, alpha: float = 0.4) -> np.ndarray:
+        """
+        在图像上叠加多标签彩色覆盖
+        
+        Args:
+            base_img: RGB 图像 (H, W, 3)
+            mask: 多标签 mask (H, W)，像素值为标签 ID（0=背景）
+            alpha: 覆盖透明度
+        
+        Returns:
+            叠加后的 RGB 图像
+        """
+        if mask is None:
+            return base_img
+        
+        overlay = base_img.copy()
+        
+        # 获取 mask 中所有唯一的标签 ID（排除背景 0）
+        unique_labels = np.unique(mask)
+        unique_labels = unique_labels[unique_labels > 0]
+        
+        if len(unique_labels) == 0:
+            return base_img
+        
+        for label_id in unique_labels:
+            label_id = int(label_id)
+            color = self.data_manager.get_label_color(label_id)
+            label_mask = mask == label_id
+            overlay[label_mask] = list(color)
+        
+        # 混合
+        result = (overlay.astype(np.float32) * alpha + base_img.astype(np.float32) * (1 - alpha)).astype(np.uint8)
+        return result
+    
     def handle_slice_change(self, value: int):
         """处理切片变化"""
         self.slice_label.setText(f"Slice: {value}")
@@ -161,12 +195,9 @@ class SliceEditorController(QObject):
                 #     green_overlay[green_mask] = [0, 255, 0]
                 #     base = (green_overlay * green_alpha + base * (1 - green_alpha)).astype(np.uint8)
                 
-                # 添加红色掩码覆盖
+                # 添加多标签彩色掩码覆盖
                 if combined is not None:
-                    overlay_red = base.copy()
-                    overlay_red[combined > 0] = [255, 0, 0]
-                    alpha_red = 0.4
-                    base = (overlay_red * alpha_red + base * (1 - alpha_red)).astype(np.uint8)
+                    base = self._apply_multilabel_overlay(base, combined)
                 
                 # 绘制 SAM2 提示
                 if self.sam2_controller and index == self.slice_slider.value():
@@ -278,10 +309,7 @@ class SliceEditorController(QObject):
                 #     img = (green_overlay * green_alpha + img * (1 - green_alpha)).astype(np.uint8)
                 
                 if combined is not None:
-                    overlay_red = img.copy()
-                    overlay_red[combined > 0] = [255, 0, 0]
-                    alpha_red = 0.4
-                    img = (overlay_red * alpha_red + img * (1 - alpha_red)).astype(np.uint8)
+                    img = self._apply_multilabel_overlay(img, combined)
                 
                 h, w, _ = img.shape
                 qimg = QImage(img.data, w, h, w * 3, QImage.Format_RGB888)

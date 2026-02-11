@@ -53,7 +53,8 @@ class RRTPlanner:
         self,
         start: Tuple[float, float, float],
         goal: Tuple[float, float, float],
-        progress_callback: Optional[Callable[[int], None]] = None
+        progress_callback: Optional[Callable[[int], None]] = None,
+        tree_callback: Optional[Callable[[List], None]] = None
     ) -> Optional[List[Tuple[float, float, float]]]:
         """在起点和终点之间规划路径"""
         start_distance = self.collision_checker.get_distance_to_obstacle(start)
@@ -88,6 +89,10 @@ class RRTPlanner:
         tree = [root]
         goal_node = None
         
+        # 实时可视化：累计树的边
+        all_edges: List[Tuple[Tuple[float, float, float], Tuple[float, float, float]]] = []
+        tree_viz_interval = 100  # 每 100 次迭代发送一次可视化数据
+        
         for iteration in range(self.max_iterations):
             if progress_callback and iteration % 100 == 0:
                 progress_callback(int((iteration / self.max_iterations) * 100))
@@ -110,11 +115,35 @@ class RRTPlanner:
             nearest_node.add_child(new_node)
             tree.append(new_node)
             
+            # 记录新边
+            all_edges.append((nearest_node.point, new_point))
+            
+            # 定期发送树可视化数据
+            if tree_callback and iteration % tree_viz_interval == 0 and all_edges:
+                tree_callback({
+                    'edges': list(all_edges),
+                    'goal': goal,
+                    'iteration': iteration,
+                    'total': self.max_iterations,
+                })
+            
             if self._distance(new_point, goal) <= self.goal_threshold:
                 if self.collision_checker.is_path_collision_free(new_point, goal):
                     goal_node = TreeNode(goal, new_node)
                     new_node.add_child(goal_node)
+                    all_edges.append((new_point, goal))
                     logger.info(f"RRT找到路径，迭代次数: {iteration + 1}")
+                    
+                    # 发送最终树数据（含找到的路径）
+                    if tree_callback:
+                        final_path = goal_node.get_path_to_root()
+                        tree_callback({
+                            'edges': list(all_edges),
+                            'goal': goal,
+                            'iteration': iteration + 1,
+                            'total': self.max_iterations,
+                            'found_path': final_path,
+                        })
                     break
         
         if goal_node is not None:
@@ -126,7 +155,8 @@ class RRTPlanner:
         self,
         waypoints: List[Tuple[float, float, float]],
         smooth: bool = True,
-        progress_callback: Optional[Callable[[int], None]] = None
+        progress_callback: Optional[Callable[[int], None]] = None,
+        tree_callback: Optional[Callable[[dict], None]] = None
     ) -> Optional[List[Tuple[float, float, float]]]:
         """多段路径规划"""
         if len(waypoints) < 2:
@@ -139,11 +169,22 @@ class RRTPlanner:
             seg_start_p = int((i / num_segments) * 100)
             seg_end_p = int(((i + 1) / num_segments) * 100)
             
-            def _seg_progress(p):
+            def _seg_progress(p, _sp=seg_start_p, _ep=seg_end_p):
                 if progress_callback:
-                    progress_callback(seg_start_p + int(p * (seg_end_p - seg_start_p) / 100))
+                    progress_callback(_sp + int(p * (_ep - _sp) / 100))
 
-            segment = self.plan(waypoints[i], waypoints[i+1], progress_callback=_seg_progress)
+            # 为 tree_callback 包装一个段标识
+            def _seg_tree_callback(data, _seg=i, _total=num_segments):
+                if tree_callback:
+                    data['segment'] = _seg
+                    data['total_segments'] = _total
+                    tree_callback(data)
+
+            segment = self.plan(
+                waypoints[i], waypoints[i+1],
+                progress_callback=_seg_progress,
+                tree_callback=_seg_tree_callback if tree_callback else None
+            )
             if segment is None:
                 logger.error(f"无法规划第 {i} 段路径")
                 return None

@@ -1,7 +1,7 @@
 """
 SAM2 UI 构建器
 
-职责：创建 SAM2 相关的 UI 组件
+职责：创建 SAM2 相关的 UI 组件（含多标签选择器）
 """
 
 from PyQt5.QtWidgets import (
@@ -13,8 +13,17 @@ from PyQt5.QtWidgets import (
     QRadioButton,
     QLabel,
     QWidget,
+    QComboBox,
 )
 from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QIcon, QPixmap, QColor
+
+
+def _create_color_icon(color_rgb, size=16):
+    """创建纯色方块图标"""
+    pixmap = QPixmap(size, size)
+    pixmap.fill(QColor(*color_rgb))
+    return QIcon(pixmap)
 
 
 def build_sam2_ui() -> dict:
@@ -34,6 +43,47 @@ def build_sam2_ui() -> dict:
     radio_manual.setChecked(True)
     seg_layout.addWidget(radio_manual)
     seg_layout.addWidget(radio_auto)
+    
+    # ===== 标签选择器 =====
+    label_group = QGroupBox("Label")
+    label_layout = QVBoxLayout()
+    label_layout.setSpacing(6)
+    label_group.setLayout(label_layout)
+    
+    # 标签下拉框 + 按钮行
+    label_row = QWidget()
+    label_row_layout = QHBoxLayout()
+    label_row_layout.setContentsMargins(0, 0, 0, 0)
+    label_row_layout.setSpacing(6)
+    label_row.setLayout(label_row_layout)
+    
+    combo_label = QComboBox()
+    combo_label.setMinimumHeight(30)
+    combo_label.setToolTip("Select current segmentation label")
+    # 默认标签会在 MainView 中通过 DataManager 初始化
+    
+    btn_add_label = QPushButton("+ Add")
+    btn_add_label.setFixedHeight(30)
+    btn_add_label.setToolTip("Add a new segmentation label")
+    btn_add_label.setStyleSheet("""
+        QPushButton { background-color: #27AE60; color: white; font-weight: bold; font-size: 12px; border-radius: 4px; padding: 0 8px; }
+        QPushButton:hover { background-color: #2ECC71; }
+    """)
+    
+    btn_remove_label = QPushButton("- Del")
+    btn_remove_label.setFixedHeight(30)
+    btn_remove_label.setToolTip("Delete the current label and its segmentation data")
+    btn_remove_label.setStyleSheet("""
+        QPushButton { background-color: #E74C3C; color: white; font-weight: bold; font-size: 12px; border-radius: 4px; padding: 0 8px; }
+        QPushButton:hover { background-color: #EC7063; }
+    """)
+    
+    label_row_layout.addWidget(combo_label, 1)
+    label_row_layout.addWidget(btn_add_label)
+    label_row_layout.addWidget(btn_remove_label)
+    
+    label_layout.addWidget(label_row)
+    seg_layout.addWidget(label_group)
     
     # SAM2 设置组
     sam2_group = QGroupBox("SAM2 Settings")
@@ -144,10 +194,15 @@ def build_sam2_ui() -> dict:
         'btn_add_positive': btn_add_positive,
         'btn_add_negative': btn_add_negative,
         'btn_add_box': btn_add_box,
-        'btn_switch_mask': btn_switch_mask, # 增加返回
+        'btn_switch_mask': btn_switch_mask,
         'btn_undo_positive': btn_undo_positive,
         'btn_clear_prompts': btn_clear_prompts,
         'btn_start_seg': btn_start_seg,
         'btn_sam2_volume_3d': btn_sam2_volume_3d,
+        # 标签选择器
+        'label_group': label_group,
+        'combo_label': combo_label,
+        'btn_add_label': btn_add_label,
+        'btn_remove_label': btn_remove_label,
     }
 

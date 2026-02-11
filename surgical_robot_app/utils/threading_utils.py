@@ -15,6 +15,7 @@ class Worker(QObject):
     finished = pyqtSignal(object)  # 任务完成信号，传递结果
     error = pyqtSignal(str)       # 错误信号
     progress = pyqtSignal(int)     # 进度信号
+    tree_update = pyqtSignal(object)  # RRT 树实时可视化信号
 
     def __init__(self, fn, *args, **kwargs):
         super().__init__()
@@ -25,9 +26,12 @@ class Worker(QObject):
     def run(self):
         """执行任务"""
         try:
-            # 如果函数接受 progress_callback 参数，则传入 self.progress.emit
-            if 'progress_callback' in self.fn.__code__.co_varnames:
+            # 自动注入回调参数
+            var_names = self.fn.__code__.co_varnames
+            if 'progress_callback' in var_names:
                 self.kwargs['progress_callback'] = self.progress.emit
+            if 'tree_callback' in var_names:
+                self.kwargs['tree_callback'] = self.tree_update.emit
             
             result = self.fn(*self.args, **self.kwargs)
             self.finished.emit(result)
@@ -36,7 +40,7 @@ class Worker(QObject):
             logger.error(error_msg)
             self.error.emit(str(e))
 
-def run_in_thread(parent, fn, on_finished=None, on_error=None, on_progress=None, *args, **kwargs):
+def run_in_thread(parent, fn, on_finished=None, on_error=None, on_progress=None, on_tree_update=None, *args, **kwargs):
     """
     便捷函数：在独立线程中运行函数
     
@@ -46,6 +50,7 @@ def run_in_thread(parent, fn, on_finished=None, on_error=None, on_progress=None,
         on_finished: 完成回调 (接收结果)
         on_error: 错误回调 (接收错误消息)
         on_progress: 进度回调 (接收 0-100 的整数)
+        on_tree_update: RRT 树实时可视化回调 (接收边列表)
         *args, **kwargs: 传递给 fn 的参数
     """
     thread = QThread(parent)
@@ -72,6 +77,8 @@ def run_in_thread(parent, fn, on_finished=None, on_error=None, on_progress=None,
         worker.error.connect(on_error)
     if on_progress:
         worker.progress.connect(on_progress)
+    if on_tree_update:
+        worker.tree_update.connect(on_tree_update)
         
     worker.finished.connect(thread.quit)
     worker.error.connect(thread.quit)

@@ -133,9 +133,9 @@ class View3DController:
         mapper.ScalarVisibilityOff()
         actor = vtkActor()
         actor.SetMapper(mapper)
-        actor.GetProperty().SetColor(0.3, 0.6, 1.0)
-        actor.GetProperty().SetSpecular(0.4)
-        actor.GetProperty().SetSpecularPower(15.0)
+        actor.GetProperty().SetColor(1.0, 0.3, 0.3)
+        actor.GetProperty().SetSpecular(0.5)
+        actor.GetProperty().SetSpecularPower(20.0)
 
         self.renderer.RemoveAllViewProps()
         self.renderer.AddActor(actor)

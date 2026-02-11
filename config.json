@@ -1,0 +1,72 @@
+{
+  "_说明": "手术机器人路径规划配置文件 - 修改后重启程序生效",
+  
+  "path_planning": {
+    "_说明_算法选择": "use_rrt: true用RRT算法, false用A*算法; use_sdf: true用SDF碰撞检测(推荐), false用点云",
+    "use_rrt": true,
+    "use_sdf": true,
+    
+    "_说明_A星参数": "仅当 use_rrt=false 时生效",
+    "grid_size": [100, 100, 105],
+    "obstacle_expansion": 4,
+    "default_grid_size": [100, 100, 100],
+    
+    "_说明_RRT参数": "step_size: 步长(越小越精细但越慢); goal_bias: 目标偏向0-1; max_iterations: 最大迭代次数",
+    "rrt_step_size": 2.0,
+    "rrt_goal_bias": 0.1,
+    "rrt_max_iterations": 5000,
+    "rrt_goal_threshold": 2.0,
+    
+    "_说明_安全距离": "safety_radius: 路径点到障碍物的最小距离; instrument_radius: 器械半径(用于体积碰撞检测)",
+    "safety_radius": 5.0,
+    "instrument_radius": 2.0,
+    
+    "_说明_路径简化": "enabled: 是否简化; max_points: 最大点数(0不限制); tolerance: 简化容差(越大点越少)",
+    "simplify_enabled": true,
+    "simplify_max_points": 50,
+    "simplify_tolerance": 1.0,
+    
+    "_说明_SDF参数": "sdf_use_interpolation: true使用三线性插值(更精确), false使用最近体素(更快)",
+    "sdf_use_interpolation": true
+  },
+  
+  "segmentation": {
+    "_说明": "分割相关配置",
+    "brush_size": 10,
+    "radius_ratio": 0.02,
+    "default_coord": 50.0,
+    "default_radius": 2.0
+  },
+  
+  "view3d": {
+    "_说明": "3D视图配置",
+    "marker_radius_ratio": 0.02,
+    "background_color": [0.1, 0.1, 0.1],
+    "coordinate_system_size_ratio": 0.2,
+    "axes_actor_scale_factor": 0.6,
+    "morph_kernel_size": 3,
+    "morph_iterations": 1,
+    "vtk_hole_size": 1000.0,
+    "enable_contour_filling": true
+  },
+  
+  "hsv_threshold": {
+    "_说明": "HSV阈值分割配置 - 红色区域检测",
+    "h1_low": 0,
+    "h1_high": 10,
+    "h2_low": 160,
+    "h2_high": 180,
+    "s_low": 50,
+    "s_high": 255,
+    "v_low": 50,
+    "v_high": 255
+  },
+  
+  "ui": {
+    "_说明": "UI界面配置",
+    "vtk_widget_min_height": 300,
+    "image_label_min_height": 400,
+    "slice_label_min_height": 150,
+    "toggle_button_max_width": 80
+  }
+}

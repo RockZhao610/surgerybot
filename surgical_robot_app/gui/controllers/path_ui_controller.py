@@ -10,7 +10,7 @@ PathUIController: 路径规划 UI 控制器
 import time
 from typing import Optional, Callable, List, Tuple
 from PyQt5.QtWidgets import QMessageBox, QListWidget, QLabel, QDialog
-from PyQt5.QtCore import QEvent, Qt, QObject
+from PyQt5.QtCore import QEvent, Qt, QObject, QTimer
 
 try:
     from surgical_robot_app.utils.logger import get_logger
@@ -111,6 +111,24 @@ class PathUIController(QObject):
         
         # 模型表面选点状态（用于两次点击模式）
         self.model_surface_pick_data: Dict[str, Dict] = {}  # 存储两次点击数据
+        
+        # RRT 回放相关
+        self._rrt_snapshots: List[dict] = []        # 存储规划过程中的快照
+        self._replay_timer: Optional[QTimer] = None  # 回放定时器
+        self._replay_index: int = 0                  # 当前回放帧索引
+        self._replay_speed_ms: int = 80              # 回放速度（毫秒/帧）
+        self._is_replaying: bool = False              # 是否正在回放
+        
+        # Path simulation 相关
+        self._sim_timer: Optional[QTimer] = None
+        self._sim_world_points: List[Tuple[float, float, float]] = []  # 插值后的世界坐标点
+        self._sim_index: int = 0
+        self._sim_speed_ms: int = 30           # 帧间隔 (ms)
+        self._sim_steps_per_segment: int = 5   # 每两个路径点之间插值的步数
+        self._is_simulating: bool = False
+        
+        # Safety zone
+        self._safety_zone_visible: bool = False
         
         # 回调函数
         self.on_path_generated: Optional[Callable] = None
@@ -236,6 +254,63 @@ class PathUIController(QObject):
             if self.vtk_status:
                 self.vtk_status.setText("Point selection cancelled")
     
+    def _collect_all_model_polydata(self):
+        """
+        收集场景中所有模型的 PolyData 并合并为一个。
+        支持多标签重建后有多个 actor 的情况。
+        
+        Returns:
+            合并后的 vtkPolyData 或 None
+        """
+        if not self.vtk_renderer:
+            return None
+        
+        from vtkmodules.vtkCommonDataModel import vtkPolyData, vtkCellArray
+        from vtkmodules.vtkCommonCore import vtkPoints
+        
+        all_points = []
+        model_count = 0
+        
+        actors = self.vtk_renderer.GetActors()
+        actors.InitTraversal()
+        while True:
+            actor = actors.GetNextItem()
+            if actor is None:
+                break
+            mapper = actor.GetMapper()
+            if mapper:
+                input_data = mapper.GetInput()
+                if input_data:
+                    try:
+                        n = input_data.GetNumberOfPoints()
+                        if n > 100:
+                            pts = input_data.GetPoints()
+                            if pts:
+                                for i in range(n):
+                                    all_points.append(pts.GetPoint(i))
+                                model_count += 1
+                    except Exception:
+                        pass
+        
+        if not all_points:
+            return None
+        
+        # 创建合并的 PolyData
+        combined = vtkPolyData()
+        vtk_pts = vtkPoints()
+        vtk_verts = vtkCellArray()
+        
+        for pt in all_points:
+            pid = vtk_pts.InsertNextPoint(pt)
+            vtk_verts.InsertNextCell(1)
+            vtk_verts.InsertCellPoint(pid)
+        
+        combined.SetPoints(vtk_pts)
+        combined.SetVerts(vtk_verts)
+        
+        logger.info(f"合并 {model_count} 个模型: 共 {len(all_points)} 个点")
+        return combined
+    
     def _handle_set_pick_mode_with_stl(self, mode: str):
         """使用STL模型的选点模式（坐标平面选点对话框）"""
         # 设置选点模式
@@ -263,27 +338,11 @@ class PathUIController(QObject):
             model_bounds = get_model_bounds(self.vtk_renderer)
         
         # 获取模型PolyData（用于在平面视图中显示投影）
+        # 多标签重建后可能有多个模型，需要合并所有模型的点
         model_polydata = None
         if self.vtk_renderer:
             try:
-                actors = self.vtk_renderer.GetActors()
-                actors.InitTraversal()
-                while True:
-                    actor = actors.GetNextItem()
-                    if actor is None:
-                        break
-                    mapper = actor.GetMapper()
-                    if mapper:
-                        input_data = mapper.GetInput()
-                        if input_data:
-                            try:
-                                num_points = input_data.GetNumberOfPoints()
-                                if num_points > 100:  # 找到模型
-                                    model_polydata = input_data
-                                    logger.info(f"Found model PolyData with {num_points} points")
-                                    break
-                            except:
-                                pass
+                model_polydata = self._collect_all_model_polydata()
             except Exception as e:
                 logger.warning(f"Error getting model PolyData: {e}")
         
@@ -513,13 +572,18 @@ class PathUIController(QObject):
             self.parent_widget.recon_progress.setValue(0)
         self.vtk_status.setText("Planning path in background...")
         
-        # 2. 启动异步路径规划
+        # 清空旧的回放数据
+        self._rrt_snapshots.clear()
+        self._set_replay_button_enabled(False)
+        
+        # 2. 启动异步路径规划（含 RRT 树实时可视化）
         run_in_thread(
             self,
             self.path_service.plan_path,
             on_finished=self._on_path_planning_finished,
             on_error=self._on_path_planning_error,
             on_progress=self._on_path_planning_progress,
+            on_tree_update=self._on_rrt_tree_update,
             smooth=True
         )
 
@@ -528,11 +592,79 @@ class PathUIController(QObject):
         if hasattr(self.parent_widget, 'recon_progress'):
             self.parent_widget.recon_progress.setValue(p)
 
+    def _on_rrt_tree_update(self, data: dict):
+        """
+        RRT 探索树实时可视化回调（在主线程执行）。
+        
+        data 包含:
+            - edges: [(parent_pt, child_pt), ...] 规划空间坐标
+            - goal: 目标点
+            - iteration / total: 当前迭代 / 总迭代
+            - found_path (可选): 已找到的路径点列表
+            - segment / total_segments (可选): 段索引
+        """
+        try:
+            edges = data.get('edges', [])
+            found_path = data.get('found_path', None)
+            iteration = data.get('iteration', 0)
+            total = data.get('total', 1)
+            segment = data.get('segment', 0)
+            total_segments = data.get('total_segments', 1)
+            
+            # 将规划空间坐标转换为 UI 空间坐标 [0,100]
+            converted_edges = []
+            for parent_pt, child_pt in edges:
+                ui_p = self.path_controller._physical_to_space(parent_pt)
+                ui_c = self.path_controller._physical_to_space(child_pt)
+                converted_edges.append((ui_p, ui_c))
+            
+            converted_path = None
+            if found_path:
+                converted_path = [
+                    self.path_controller._physical_to_space(pt) for pt in found_path
+                ]
+            
+            # 保存快照用于回放（已转换为 UI 坐标）
+            self._rrt_snapshots.append({
+                'edges': converted_edges,
+                'found_path': converted_path,
+                'iteration': iteration,
+                'total': total,
+                'segment': segment,
+                'total_segments': total_segments,
+            })
+            
+            # 更新可视化
+            self.viz_manager.update_rrt_tree_viz(converted_edges, converted_path)
+            
+            # 更新状态文字
+            if self.vtk_status:
+                seg_info = f" (Segment {segment + 1}/{total_segments})" if total_segments > 1 else ""
+                if found_path:
+                    self.vtk_status.setText(f"RRT: Path found! {len(edges)} nodes{seg_info}")
+                else:
+                    self.vtk_status.setText(
+                        f"RRT: Exploring... iter {iteration}/{total}, {len(edges)} nodes{seg_info}"
+                    )
+        except Exception as e:
+            logger.warning(f"RRT tree visualization error: {e}")
+
     def _on_path_planning_finished(self, path_points):
         """规划完成回调"""
         # 隐藏进度条
         if hasattr(self.parent_widget, 'recon_progress'):
             self.parent_widget.recon_progress.setVisible(False)
+        
+        # 清除 RRT 探索树可视化（保留最终路径）
+        self.viz_manager.clear_rrt_tree_viz()
+        
+        # 启用回放按钮（如果有快照数据）
+        if self._rrt_snapshots:
+            self._set_replay_button_enabled(True)
+        
+        # 启用仿真按钮和安全区域复选框
+        self._set_simulate_button_enabled(True)
+        self._set_safety_zone_enabled(True)
             
         if path_points:
             self.viz_manager.visualize_path(path_points)
@@ -550,6 +682,9 @@ class PathUIController(QObject):
         """规划错误回调"""
         if hasattr(self.parent_widget, 'recon_progress'):
             self.parent_widget.recon_progress.setVisible(False)
+        
+        # 清除 RRT 探索树可视化
+        self.viz_manager.clear_rrt_tree_viz()
             
         logger.error(f"Path planning error: {error_msg}")
         
@@ -645,11 +780,26 @@ class PathUIController(QObject):
     
     def handle_reset_path(self, *args):
         """处理重置路径事件"""
+        # 停止正在进行的回放和仿真
+        self._stop_replay()
+        if self._is_simulating:
+            self._stop_simulation()
+        
         # 清除路径控制器中的数据
         self.path_controller.clear_path()
         
-        # 清除可视化
+        # 清除可视化（含 RRT 探索树 + 仿真 + 安全区域）
+        self.viz_manager.clear_rrt_tree_viz()
+        self.viz_manager.clear_sim_viz()
+        self.viz_manager.clear_safety_tube()
         self.viz_manager.clear_all_path_viz()
+        
+        # 清空回放数据
+        self._rrt_snapshots.clear()
+        self._set_replay_button_enabled(False)
+        self._set_simulate_button_enabled(False)
+        self._set_safety_zone_enabled(False)
+        self._safety_zone_visible = False
         
         # 清除路径列表
         self.path_list.clear()
@@ -819,19 +969,7 @@ class PathUIController(QObject):
             try:
                 from surgical_robot_app.vtk_utils.coords import get_model_bounds
                 model_bounds = get_model_bounds(self.vtk_renderer)
-                
-                actors = self.vtk_renderer.GetActors()
-                actors.InitTraversal()
-                while True:
-                    actor = actors.GetNextItem()
-                    if actor is None:
-                        break
-                    mapper = actor.GetMapper()
-                    if mapper:
-                        input_data = mapper.GetInput()
-                        if input_data and input_data.GetNumberOfPoints() > 100:
-                            model_polydata = input_data
-                            break
+                model_polydata = self._collect_all_model_polydata()
             except Exception as e:
                 logger.warning(f"获取模型数据失败: {e}")
         
@@ -859,74 +997,79 @@ class PathUIController(QObject):
         dialog.raise_()
     
     def _on_path_point_updated(self, index: int, x: float, y: float, z: float):
-        """处理路径点更新，支持自动局部避障"""
+        """
+        处理路径点更新 — 对受影响的前后两段进行 RRT 局部重规划。
+        如果重规划失败则退化为直线连接。
+        """
         path_points = list(self.path_controller.path_points)
         if not (0 <= index < len(path_points)):
             return
             
         new_pos = (x, y, z)
         
-        # 1. 检查是否存在碰撞
-        needs_replanning = False
-        collision_checker = getattr(self.path_controller, '_collision_checker', None)
-        if collision_checker:
-            if index > 0 and not collision_checker.is_path_collision_free(path_points[index-1], new_pos):
-                needs_replanning = True
-            if not needs_replanning and index < len(path_points) - 1:
-                if not collision_checker.is_path_collision_free(new_pos, path_points[index+1]):
-                    needs_replanning = True
-        
-        # 2. 如果有碰撞，询问用户
-        do_auto_avoidance = False
-        if needs_replanning:
-            from PyQt5.QtWidgets import QMessageBox
-            reply = QMessageBox.question(
-                self.parent_widget,
-                "Path Collision",
-                "The new segments will cross an obstacle.\n\n"
-                "Would you like the system to automatically plan a local bypass route?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.Yes
-            )
-            do_auto_avoidance = (reply == QMessageBox.Yes)
-        
-        # 3. 更新路径
-        if do_auto_avoidance:
+        # 尝试对受影响的段进行局部重规划
+        replan_success = False
+        if self.path_controller.rrt_planner is not None:
             new_full_path = []
-            # 添加受影响之前的路径
             new_full_path.extend(path_points[:max(0, index)])
             
-            # 处理 [前一点 -> 新点] 段
+            seg1_ok = False
+            seg2_ok = False
+            
+            # [前一点 -> 新点]
             if index > 0:
                 seg1 = self.path_service.plan_local_segment(path_points[index-1], new_pos)
-                if seg1: new_full_path.extend(seg1[1:]) # 排除重复的起始点
-                else: new_full_path.append(new_pos)
+                if seg1 and len(seg1) >= 2:
+                    new_full_path.extend(seg1[1:])
+                    seg1_ok = True
+                else:
+                    new_full_path.append(new_pos)
             else:
                 new_full_path.append(new_pos)
+                seg1_ok = True
                 
-            # 处理 [新点 -> 后一点] 段
+            # [新点 -> 后一点]
             if index < len(path_points) - 1:
                 seg2 = self.path_service.plan_local_segment(new_pos, path_points[index+1])
-                if seg2: new_full_path.extend(seg2[1:])
-                else: new_full_path.append(path_points[index+1])
+                if seg2 and len(seg2) >= 2:
+                    new_full_path.extend(seg2[1:])
+                    seg2_ok = True
+                else:
+                    new_full_path.append(path_points[index+1])
+            else:
+                seg2_ok = True
             
-            # 添加后续路径
+            # 保留后续路径
             if index < len(path_points) - 2:
                 new_full_path.extend(path_points[index+2:])
                 
             path_points = new_full_path
             self.path_controller.path_points = path_points
+            replan_success = seg1_ok and seg2_ok
         else:
             path_points[index] = new_pos
             self.path_controller.path_points = path_points
+        
+        # 同步起点/终点标记位置
+        updated_points = self.path_controller.path_points
+        if updated_points:
+            self.path_controller.start_point = updated_points[0]
+            self.path_controller.end_point = updated_points[-1]
             
-        # 4. 刷新显示（使用公共逻辑）
+        # 清除旧的回放数据（路径已变更，旧快照不再有效）
+        self._rrt_snapshots.clear()
+        self._set_replay_button_enabled(False)
+        
+        # 刷新显示
         self.viz_manager.clear_preview_marker()
+        self.viz_manager.clear_rrt_tree_viz()
         self._refresh_after_history_change()
         
         if self.vtk_status:
-            msg = "Local avoidance applied" if do_auto_avoidance else f"Point #{index+1} updated"
-            self.vtk_status.setText(msg)
+            if replan_success:
+                self.vtk_status.setText(f"Point #{index+1} updated (path replanned)")
+            else:
+                self.vtk_status.setText(f"Point #{index+1} updated (replan failed, straight line)")
     
     def _on_path_point_deleted(self, index: int):
         """处理路径点删除"""
@@ -935,19 +1078,21 @@ class PathUIController(QObject):
             del path_points[index]
             self.path_controller.path_points = path_points
             
+            # 同步起点/终点标记
+            if path_points:
+                self.path_controller.start_point = path_points[0]
+                self.path_controller.end_point = path_points[-1]
+            
             # 清除预览点
             self.viz_manager.clear_preview_marker()
             
-            # 重新可视化路径
-            self.viz_manager.clear_all_path_viz()
-            self.viz_manager.visualize_path(path_points)
-            self.viz_manager.visualize_path_points(path_points)
+            # 清除旧的回放数据（路径已变更）
+            self._rrt_snapshots.clear()
+            self._set_replay_button_enabled(False)
+            self.viz_manager.clear_rrt_tree_viz()
             
-            # 更新列表
-            self._update_path_list_display()
-            
-            # 更新显示
-            self.viz_manager.update_vtk_display()
+            # 重新可视化路径（使用统一逻辑，已包含列表更新和 VTK 刷新）
+            self._refresh_after_history_change()
             
             if self.vtk_status:
                 self.vtk_status.setText(f"Path point #{index + 1} deleted")
@@ -958,4 +1103,282 @@ class PathUIController(QObject):
         """实时预览路径点编辑"""
         # 更新预览标记
         self.viz_manager.update_preview_marker(x, y, z, 'waypoint')
+
+    # -------------------- RRT 探索过程回放 --------------------
+
+    def _set_replay_button_enabled(self, enabled: bool):
+        """设置 Replay 按钮可用状态"""
+        btn = getattr(self.parent_widget, 'btn_replay_path', None)
+        if btn:
+            btn.setEnabled(enabled)
+
+    def _set_replay_button_text(self, text: str):
+        """设置 Replay 按钮文字"""
+        btn = getattr(self.parent_widget, 'btn_replay_path', None)
+        if btn:
+            btn.setText(text)
+
+    def handle_replay_rrt(self, *args):
+        """处理 RRT 回放按钮点击 — 切换回放/停止"""
+        if self._is_replaying:
+            self._stop_replay()
+        else:
+            self._start_replay()
+
+    def _start_replay(self):
+        """开始 RRT 探索过程回放"""
+        if not self._rrt_snapshots:
+            if self.vtk_status:
+                self.vtk_status.setText("No RRT data to replay")
+            return
+        
+        # 暂时隐藏最终路径线
+        self.viz_manager.clear_path_line()
+        
+        # 初始化回放状态
+        self._replay_index = 0
+        self._is_replaying = True
+        self._set_replay_button_text("Stop")
+        
+        # 创建定时器
+        if self._replay_timer is None:
+            self._replay_timer = QTimer(self)
+            self._replay_timer.timeout.connect(self._replay_tick)
+        
+        self._replay_timer.start(self._replay_speed_ms)
+        logger.info(f"RRT 回放开始: {len(self._rrt_snapshots)} 帧, {self._replay_speed_ms}ms/帧")
+
+    def _stop_replay(self):
+        """停止 RRT 回放"""
+        if self._replay_timer:
+            self._replay_timer.stop()
+        
+        self._is_replaying = False
+        self._set_replay_button_text("Replay")
+        
+        # 清除回放的探索树，恢复最终路径
+        self.viz_manager.clear_rrt_tree_viz()
+        if self.path_controller.path_points:
+            self.viz_manager.visualize_path(self.path_controller.path_points)
+        self.viz_manager.update_vtk_display()
+        
+        if self.vtk_status:
+            self.vtk_status.setText("Replay stopped")
+        logger.info("RRT 回放停止")
+
+    def _replay_tick(self):
+        """回放定时器的每一帧"""
+        if self._replay_index >= len(self._rrt_snapshots):
+            # 回放结束：在最后一帧停留片刻后恢复
+            self._replay_timer.stop()
+            # 延迟 1 秒后自动清理
+            QTimer.singleShot(1500, self._stop_replay)
+            if self.vtk_status:
+                self.vtk_status.setText("Replay finished")
+            return
+        
+        snapshot = self._rrt_snapshots[self._replay_index]
+        edges = snapshot.get('edges', [])
+        found_path = snapshot.get('found_path', None)
+        iteration = snapshot.get('iteration', 0)
+        total = snapshot.get('total', 1)
+        segment = snapshot.get('segment', 0)
+        total_segments = snapshot.get('total_segments', 1)
+        
+        # 渲染当前帧
+        self.viz_manager.update_rrt_tree_viz(edges, found_path)
+        
+        # 更新状态文字
+        if self.vtk_status:
+            frame_info = f"[{self._replay_index + 1}/{len(self._rrt_snapshots)}]"
+            seg_info = f" Seg {segment + 1}/{total_segments}" if total_segments > 1 else ""
+            if found_path:
+                self.vtk_status.setText(f"Replay {frame_info}: Path found! {len(edges)} nodes{seg_info}")
+            else:
+                self.vtk_status.setText(f"Replay {frame_info}: iter {iteration}/{total}, {len(edges)} nodes{seg_info}")
+        
+        self._replay_index += 1
+
+    # -------------------- Path Simulation (Instrument Animation) --------------------
+
+    def _set_simulate_button_enabled(self, enabled: bool):
+        btn = getattr(self.parent_widget, 'btn_simulate_path', None)
+        if btn:
+            btn.setEnabled(enabled)
+
+    def _set_simulate_button_text(self, text: str):
+        btn = getattr(self.parent_widget, 'btn_simulate_path', None)
+        if btn:
+            btn.setText(text)
+
+    def handle_simulate_path(self, *args):
+        """Toggle path simulation start / stop."""
+        if self._is_simulating:
+            self._stop_simulation()
+        else:
+            self._start_simulation()
+
+    def _build_sim_world_points(self) -> List[Tuple[float, float, float]]:
+        """
+        Build an interpolated list of world-coordinate points for smooth animation.
+        Takes the current path_points (space coords [0,100]), converts each segment
+        into `_sim_steps_per_segment` intermediate world-coord points.
+        """
+        from surgical_robot_app.vtk_utils.coords import get_model_bounds, space_to_world
+        
+        path_points = self.path_controller.path_points
+        if not path_points or len(path_points) < 2:
+            return []
+        
+        bounds = get_model_bounds(self.vtk_renderer)
+        if not bounds or len(bounds) < 6:
+            bounds = (-50.0, 50.0, -50.0, 50.0, -50.0, 50.0)
+        
+        world_pts: List[Tuple[float, float, float]] = []
+        steps = self._sim_steps_per_segment
+        
+        for i in range(len(path_points) - 1):
+            p0 = path_points[i]
+            p1 = path_points[i + 1]
+            for s in range(steps):
+                t = s / steps
+                sp = (
+                    p0[0] + (p1[0] - p0[0]) * t,
+                    p0[1] + (p1[1] - p0[1]) * t,
+                    p0[2] + (p1[2] - p0[2]) * t,
+                )
+                world_pts.append(space_to_world(bounds, sp))
+        
+        # Add the final point
+        world_pts.append(space_to_world(bounds, path_points[-1]))
+        return world_pts
+
+    def _start_simulation(self):
+        """Start instrument simulation along the path."""
+        self._sim_world_points = self._build_sim_world_points()
+        if not self._sim_world_points:
+            if self.vtk_status:
+                self.vtk_status.setText("No path to simulate")
+            return
+        
+        # Dim the original path line to make trail more visible
+        self.viz_manager.clear_path_line()
+        
+        self._sim_index = 0
+        self._is_simulating = True
+        self._set_simulate_button_text("Stop")
+        self._set_replay_button_enabled(False)  # disable replay during sim
+        
+        if self._sim_timer is None:
+            self._sim_timer = QTimer(self)
+            self._sim_timer.timeout.connect(self._sim_tick)
+        
+        self._sim_timer.start(self._sim_speed_ms)
+        logger.info(f"Path simulation started: {len(self._sim_world_points)} frames, {self._sim_speed_ms}ms/frame")
+
+    def _stop_simulation(self):
+        """Stop the simulation and restore the path."""
+        if self._sim_timer:
+            self._sim_timer.stop()
+        
+        self._is_simulating = False
+        self._set_simulate_button_text("Simulate")
+        
+        # Clean up simulation actors, restore path line
+        self.viz_manager.clear_sim_viz()
+        if self.path_controller.path_points:
+            self.viz_manager.visualize_path(self.path_controller.path_points)
+        self.viz_manager.update_vtk_display()
+        
+        # Re-enable replay if snapshots exist
+        if self._rrt_snapshots:
+            self._set_replay_button_enabled(True)
+        
+        if self.vtk_status:
+            self.vtk_status.setText("Simulation stopped")
+        logger.info("Path simulation stopped")
+
+    def _sim_tick(self):
+        """One animation frame of the path simulation."""
+        if self._sim_index >= len(self._sim_world_points):
+            # Reached the end – pause briefly then auto-stop
+            self._sim_timer.stop()
+            if self.vtk_status:
+                self.vtk_status.setText("Simulation complete")
+            QTimer.singleShot(2000, self._stop_simulation)
+            return
+        
+        pos = self._sim_world_points[self._sim_index]
+        
+        # Update instrument sphere
+        self.viz_manager.update_sim_instrument(pos)
+        
+        # Update trail (all points from start to current)
+        if self._sim_index > 0:
+            self.viz_manager.update_sim_trail(self._sim_world_points[:self._sim_index + 1])
+        
+        # Update status
+        if self.vtk_status:
+            progress = int((self._sim_index + 1) / len(self._sim_world_points) * 100)
+            self.vtk_status.setText(
+                f"Simulating... {progress}% [{self._sim_index + 1}/{len(self._sim_world_points)}]"
+            )
+        
+        # Render
+        self.viz_manager.update_vtk_display()
+        
+        self._sim_index += 1
+
+    # -------------------- Safety Zone Toggle --------------------
+
+    def _set_safety_zone_enabled(self, enabled: bool):
+        chk = getattr(self.parent_widget, 'chk_safety_zone', None)
+        if chk:
+            chk.setEnabled(enabled)
+            if not enabled:
+                chk.setChecked(False)
+
+    def handle_toggle_safety_zone(self, checked: bool):
+        """Handle the Safety Zone checkbox toggled on/off."""
+        if checked:
+            path_points = self.path_controller.path_points
+            if path_points and len(path_points) >= 2:
+                # Use the configured safety_radius converted to world-scale
+                safety_radius_world = self._get_safety_radius_world()
+                self.viz_manager.show_safety_tube(path_points, safety_radius_world)
+                self._safety_zone_visible = True
+                if self.vtk_status:
+                    self.vtk_status.setText("Safety zone displayed")
+            else:
+                if self.vtk_status:
+                    self.vtk_status.setText("No path for safety zone")
+                # Uncheck since nothing to show
+                chk = getattr(self.parent_widget, 'chk_safety_zone', None)
+                if chk:
+                    chk.setChecked(False)
+        else:
+            self.viz_manager.clear_safety_tube()
+            self.viz_manager.update_vtk_display()
+            self._safety_zone_visible = False
+
+    def _get_safety_radius_world(self) -> float:
+        """
+        Convert the path controller's safety_radius (in normalised [0,100] space)
+        to world coordinates using the model bounds.
+        """
+        from surgical_robot_app.vtk_utils.coords import get_model_bounds
+        
+        # Get the configured safety radius (default 5.0 in normalised space)
+        safety_r = getattr(self.path_controller, 'rrt_safety_radius', 5.0)
+        
+        bounds = get_model_bounds(self.vtk_renderer)
+        if bounds and len(bounds) >= 6:
+            dx = bounds[1] - bounds[0]
+            dy = bounds[3] - bounds[2]
+            dz = bounds[5] - bounds[4]
+            avg_extent = (dx + dy + dz) / 3.0
+            # safety_r is in [0,100] space, convert proportionally
+            return avg_extent * safety_r / 100.0
+        else:
+            return safety_r  # fallback: use raw value
 
